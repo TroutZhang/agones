@@ -6,7 +6,7 @@ RUN apt-get update && \
 
 # install go
 WORKDIR /usr/local
-ENV GO_VERSION=1.19.1
+ENV GO_VERSION=1.20.10
 ENV GOPATH /go
 ENV GO111MODULE=on
 RUN wget -q https://dl.google.com/go/go${GO_VERSION}.linux-amd64.tar.gz && \
@@ -15,7 +15,7 @@ RUN wget -q https://dl.google.com/go/go${GO_VERSION}.linux-amd64.tar.gz && \
 ENV PATH /usr/local/go/bin:/go/bin:$PATH
 
 # install kubectl without gcloud as we want the last version
-ENV KUBECTL_VER 1.23.9
+ENV KUBECTL_VER 1.27.6
 RUN curl -LO https://storage.googleapis.com/kubernetes-release/release/v${KUBECTL_VER}/bin/linux/amd64/kubectl && \
     chmod go+rx ./kubectl && \
     mv ./kubectl /usr/local/bin/kubectl
@@ -29,18 +29,8 @@ RUN curl -L  ${HELM_URL} > /tmp/helm.tar.gz \
     && chmod go+rx /usr/local/bin/helm \
     && rm /tmp/helm.tar.gz && rm -rf /tmp/linux-amd64
 
-# set up Consul.
-ENV CONSUL_VERSION=1.2.1
-ENV HASHICORP_RELEASES=https://releases.hashicorp.com
-RUN mkdir -p /tmp/build && \
-    wget ${HASHICORP_RELEASES}/consul/${CONSUL_VERSION}/consul_${CONSUL_VERSION}_linux_amd64.zip \
-    -P /tmp/build/  && \
-    unzip -d /usr/local/bin/ /tmp/build/consul_${CONSUL_VERSION}_linux_amd64.zip && \
-    cd /tmp && \
-    rm -rf /tmp/build && \
-    chmod go+rx /usr/local/bin/consul && \
-    # tiny smoke test to ensure the binary we downloaded runs
-    consul version
+# install gotestsum test runner
+RUN go install gotest.tools/gotestsum@latest
 
 # make sure we keep the path to go
 RUN echo "export PATH=/usr/local/go/bin:/go/bin/:\$PATH" >> /root/.bashrc

@@ -16,6 +16,7 @@ package gameservers
 
 import (
 	"context"
+	"strings"
 
 	"agones.dev/agones/pkg/apis/agones"
 	agonesv1 "agones.dev/agones/pkg/apis/agones/v1"
@@ -30,6 +31,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	corev1 "k8s.io/api/core/v1"
+	k8sv1 "k8s.io/api/core/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/informers"
@@ -45,16 +47,17 @@ import (
 // event happens on a node, and a Pod is recreated with a new Address for a
 // GameServer
 type MigrationController struct {
-	baseLogger       *logrus.Entry
-	podSynced        cache.InformerSynced
-	podLister        corelisterv1.PodLister
-	gameServerSynced cache.InformerSynced
-	gameServerGetter getterv1.GameServersGetter
-	gameServerLister listerv1.GameServerLister
-	nodeLister       corelisterv1.NodeLister
-	nodeSynced       cache.InformerSynced
-	workerqueue      *workerqueue.WorkerQueue
-	recorder         record.EventRecorder
+	baseLogger               *logrus.Entry
+	podSynced                cache.InformerSynced
+	podLister                corelisterv1.PodLister
+	gameServerSynced         cache.InformerSynced
+	gameServerGetter         getterv1.GameServersGetter
+	gameServerLister         listerv1.GameServerLister
+	nodeLister               corelisterv1.NodeLister
+	nodeSynced               cache.InformerSynced
+	workerqueue              *workerqueue.WorkerQueue
+	recorder                 record.EventRecorder
+	syncPodPortsToGameServer func(*agonesv1.GameServer, *corev1.Pod) error
 }
 
 // NewMigrationController returns a MigrationController
@@ -62,18 +65,21 @@ func NewMigrationController(health healthcheck.Handler,
 	kubeClient kubernetes.Interface,
 	agonesClient versioned.Interface,
 	kubeInformerFactory informers.SharedInformerFactory,
-	agonesInformerFactory externalversions.SharedInformerFactory) *MigrationController {
+	agonesInformerFactory externalversions.SharedInformerFactory,
+	syncPodPortsToGameServer func(*agonesv1.GameServer, *corev1.Pod) error,
+) *MigrationController {
 
 	podInformer := kubeInformerFactory.Core().V1().Pods().Informer()
 	gameserverInformer := agonesInformerFactory.Agones().V1().GameServers()
 	mc := &MigrationController{
-		podSynced:        podInformer.HasSynced,
-		podLister:        kubeInformerFactory.Core().V1().Pods().Lister(),
-		gameServerSynced: gameserverInformer.Informer().HasSynced,
-		gameServerGetter: agonesClient.AgonesV1(),
-		gameServerLister: gameserverInformer.Lister(),
-		nodeLister:       kubeInformerFactory.Core().V1().Nodes().Lister(),
-		nodeSynced:       kubeInformerFactory.Core().V1().Nodes().Informer().HasSynced,
+		podSynced:                podInformer.HasSynced,
+		podLister:                kubeInformerFactory.Core().V1().Pods().Lister(),
+		gameServerSynced:         gameserverInformer.Informer().HasSynced,
+		gameServerGetter:         agonesClient.AgonesV1(),
+		gameServerLister:         gameserverInformer.Lister(),
+		nodeLister:               kubeInformerFactory.Core().V1().Nodes().Lister(),
+		nodeSynced:               kubeInformerFactory.Core().V1().Nodes().Informer().HasSynced,
+		syncPodPortsToGameServer: syncPodPortsToGameServer,
 	}
 
 	mc.baseLogger = runtime.NewLoggerWithType(mc)
@@ -85,7 +91,7 @@ func NewMigrationController(health healthcheck.Handler,
 	eventBroadcaster.StartRecordingToSink(&typedcorev1.EventSinkImpl{Interface: kubeClient.CoreV1().Events("")})
 	mc.recorder = eventBroadcaster.NewRecorder(scheme.Scheme, corev1.EventSource{Component: "migration-controller"})
 
-	podInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+	_, _ = podInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
 			pod := obj.(*corev1.Pod)
 			if isActiveGameServerWithNode(pod) {
@@ -104,13 +110,13 @@ func NewMigrationController(health healthcheck.Handler,
 
 // Run processes the rate limited queue.
 // Will block until stop is closed
-func (mc *MigrationController) Run(ctx context.Context) error {
+func (mc *MigrationController) Run(ctx context.Context, workers int) error {
 	mc.baseLogger.Debug("Wait for cache sync")
 	if !cache.WaitForCacheSync(ctx.Done(), mc.nodeSynced, mc.gameServerSynced, mc.podSynced) {
 		return errors.New("failed to wait for caches to sync")
 	}
 
-	mc.workerqueue.Run(ctx, 1)
+	mc.workerqueue.Run(ctx, workers)
 	return nil
 }
 
@@ -175,19 +181,15 @@ func (mc *MigrationController) syncGameServer(ctx context.Context, key string) e
 	if err != nil {
 		return errors.Wrapf(err, "error retrieving node %s for Pod %s", pod.Spec.NodeName, pod.ObjectMeta.Name)
 	}
-	address, err := address(node)
-	if err != nil {
-		return err
-	}
 
-	if pod.Spec.NodeName != gs.Status.NodeName || address != gs.Status.Address {
+	if pod.Spec.NodeName != gs.Status.NodeName || !mc.anyAddressMatch(node, gs) {
 		gsCopy := gs.DeepCopy()
 
 		var eventMsg string
 		// If the GameServer has yet to become ready, we will reapply the Address and Port
 		// otherwise, we move it to Unhealthy so that a new GameServer will be recreated.
 		if gsCopy.IsBeforeReady() {
-			gsCopy, err = applyGameServerAddressAndPort(gsCopy, node, pod)
+			gsCopy, err = applyGameServerAddressAndPort(gsCopy, node, pod, mc.syncPodPortsToGameServer)
 			if err != nil {
 				return err
 			}
@@ -206,4 +208,20 @@ func (mc *MigrationController) syncGameServer(ctx context.Context, key string) e
 	}
 
 	return nil
+}
+
+func (mc *MigrationController) anyAddressMatch(node *k8sv1.Node, gs *agonesv1.GameServer) bool {
+	nodeAddresses := []string{}
+	for _, a := range node.Status.Addresses {
+		if a.Address == gs.Status.Address {
+			return true
+		}
+		nodeAddresses = append(nodeAddresses, a.Address)
+	}
+	mc.loggerForGameServer(gs).
+		WithField("gs", gs.Name).
+		WithField("gs.Status.Address", gs.Status.Address).
+		WithField("node.Status.Addresses", strings.Join(nodeAddresses, ",")).
+		Warn("GameServer/Node address mismatch")
+	return false
 }

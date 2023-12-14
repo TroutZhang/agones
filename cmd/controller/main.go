@@ -25,20 +25,17 @@ import (
 	"time"
 
 	"agones.dev/agones/pkg"
-	agonesv1 "agones.dev/agones/pkg/apis/agones/v1"
 	"agones.dev/agones/pkg/client/clientset/versioned"
 	"agones.dev/agones/pkg/client/informers/externalversions"
+	"agones.dev/agones/pkg/cloudproduct"
 	"agones.dev/agones/pkg/fleetautoscalers"
 	"agones.dev/agones/pkg/fleets"
-	"agones.dev/agones/pkg/gameserverallocations"
 	"agones.dev/agones/pkg/gameservers"
 	"agones.dev/agones/pkg/gameserversets"
 	"agones.dev/agones/pkg/metrics"
-	"agones.dev/agones/pkg/util/apiserver"
-	"agones.dev/agones/pkg/util/https"
 	"agones.dev/agones/pkg/util/runtime"
 	"agones.dev/agones/pkg/util/signals"
-	"agones.dev/agones/pkg/util/webhooks"
+	"github.com/google/uuid"
 	"github.com/heptiolabs/healthcheck"
 	"github.com/pkg/errors"
 	prom "github.com/prometheus/client_golang/prometheus"
@@ -49,9 +46,12 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	extclientset "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset"
 	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
+	"k8s.io/client-go/tools/leaderelection"
+	"k8s.io/client-go/tools/leaderelection/resourcelock"
 )
 
 const (
@@ -79,6 +79,8 @@ const (
 	kubeconfigFlag               = "kubeconfig"
 	allocationBatchWaitTime      = "allocation-batch-wait-time"
 	defaultResync                = 30 * time.Second
+	podNamespace                 = "pod-namespace"
+	leaderElectionFlag           = "leader-election"
 )
 
 var (
@@ -105,6 +107,7 @@ func setupLogging(logDir string, logSizeLimitMB int) {
 
 // main starts the operator for the gameserver CRD
 func main() {
+	ctx, cancel := signals.NewSigKillContext()
 	ctlConf := parseEnvFlags()
 
 	if ctlConf.LogDir != "" {
@@ -154,10 +157,10 @@ func main() {
 		logger.WithError(err).Fatal("Could not create the agones api clientset")
 	}
 
-	// https server and the items that share the Mux for routing
-	httpsServer := https.NewServer(ctlConf.CertFile, ctlConf.KeyFile)
-	wh := webhooks.NewWebHook(httpsServer.Mux)
-	api := apiserver.NewAPIServer(httpsServer.Mux)
+	controllerHooks, err := cloudproduct.NewFromFlag(ctx, kubeClient)
+	if err != nil {
+		logger.WithError(err).Fatal("Could not initialize cloud product")
+	}
 
 	agonesInformerFactory := externalversions.NewSharedInformerFactory(agonesClient, defaultResync)
 	kubeInformerFactory := informers.NewSharedInformerFactory(kubeClient, defaultResync)
@@ -203,37 +206,41 @@ func main() {
 
 	gsCounter := gameservers.NewPerNodeCounter(kubeInformerFactory, agonesInformerFactory)
 
-	gsController := gameservers.NewController(wh, health,
+	gsController := gameservers.NewController(controllerHooks, health,
 		ctlConf.MinPort, ctlConf.MaxPort, ctlConf.SidecarImage, ctlConf.AlwaysPullSidecar,
 		ctlConf.SidecarCPURequest, ctlConf.SidecarCPULimit,
 		ctlConf.SidecarMemoryRequest, ctlConf.SidecarMemoryLimit, ctlConf.SdkServiceAccount,
 		kubeClient, kubeInformerFactory, extClient, agonesClient, agonesInformerFactory)
-	gsSetController := gameserversets.NewController(wh, health, gsCounter,
+	gsSetController := gameserversets.NewController(health, gsCounter,
 		kubeClient, extClient, agonesClient, agonesInformerFactory)
-	fleetController := fleets.NewController(wh, health, kubeClient, extClient, agonesClient, agonesInformerFactory)
-	gasController := gameserverallocations.NewController(api, health, gsCounter, kubeClient, kubeInformerFactory,
-		agonesClient, agonesInformerFactory, 10*time.Second, 30*time.Second, ctlConf.AllocationBatchWaitTime)
-	fasController := fleetautoscalers.NewController(wh, health,
-		kubeClient, extClient, agonesClient, agonesInformerFactory)
+	fleetController := fleets.NewController(health, kubeClient, extClient, agonesClient, agonesInformerFactory)
+	fasController := fleetautoscalers.NewController(health,
+		kubeClient, extClient, agonesClient, agonesInformerFactory, gsCounter)
 
 	rs = append(rs,
-		httpsServer, gsCounter, gsController, gsSetController, fleetController, fasController, gasController, server)
+		gsCounter, gsController, gsSetController, fleetController, fasController)
 
-	ctx := signals.NewSigKillContext()
-
-	kubeInformerFactory.Start(ctx.Done())
-	agonesInformerFactory.Start(ctx.Done())
-
-	for _, r := range rs {
-		go func(rr runner) {
-			if runErr := rr.Run(ctx, ctlConf.NumWorkers); runErr != nil {
-				logger.WithError(runErr).Fatalf("could not start runner: %T", rr)
-			}
-		}(r)
+	runRunner := func(r runner) {
+		if err := r.Run(ctx, ctlConf.NumWorkers); err != nil {
+			logger.WithError(err).Fatalf("could not start runner! %T", r)
+		}
 	}
 
-	<-ctx.Done()
-	logger.Info("Shut down agones controllers")
+	// Server has to be started earlier because it contains the health check.
+	// This allows the controller to not fail health check during install when there is replication
+	go runRunner(server)
+
+	whenLeader(ctx, cancel, logger, ctlConf.LeaderElection, kubeClient, ctlConf.PodNamespace, func(ctx context.Context) {
+		kubeInformerFactory.Start(ctx.Done())
+		agonesInformerFactory.Start(ctx.Done())
+
+		for _, r := range rs {
+			go runRunner(r)
+		}
+
+		<-ctx.Done()
+		logger.Info("Shut down agones controllers")
+	})
 }
 
 func parseEnvFlags() config {
@@ -243,7 +250,7 @@ func parseEnvFlags() config {
 	}
 
 	base := filepath.Dir(exec)
-	viper.SetDefault(sidecarImageFlag, "gcr.io/agones-images/agones-sdk:"+pkg.Version)
+	viper.SetDefault(sidecarImageFlag, "us-docker.pkg.dev/agones-images/release/agones-sdk:"+pkg.Version)
 	viper.SetDefault(sidecarCPURequestFlag, "0")
 	viper.SetDefault(sidecarCPULimitFlag, "0")
 	viper.SetDefault(sidecarMemoryRequestFlag, "0")
@@ -256,6 +263,8 @@ func parseEnvFlags() config {
 	viper.SetDefault(enableStackdriverMetricsFlag, false)
 	viper.SetDefault(stackdriverLabels, "")
 	viper.SetDefault(allocationBatchWaitTime, 500*time.Millisecond)
+	viper.SetDefault(podNamespace, "agones-system")
+	viper.SetDefault(leaderElectionFlag, false)
 
 	viper.SetDefault(projectIDFlag, "")
 	viper.SetDefault(numWorkersFlag, 64)
@@ -288,6 +297,9 @@ func parseEnvFlags() config {
 	pflag.Int32(logSizeLimitMBFlag, 1000, "Log file size limit in MB")
 	pflag.String(logLevelFlag, viper.GetString(logLevelFlag), "Agones Log level")
 	pflag.Duration(allocationBatchWaitTime, viper.GetDuration(allocationBatchWaitTime), "Flag to configure the waiting period between allocations batches")
+	pflag.String(podNamespace, viper.GetString(podNamespace), "namespace of current pod")
+	pflag.Bool(leaderElectionFlag, viper.GetBool(leaderElectionFlag), "Flag to enable/disable leader election for controller pod")
+	cloudproduct.BindFlags()
 	runtime.FeaturesBindFlags()
 	pflag.Parse()
 
@@ -315,7 +327,10 @@ func parseEnvFlags() config {
 	runtime.Must(viper.BindEnv(logDirFlag))
 	runtime.Must(viper.BindEnv(logSizeLimitMBFlag))
 	runtime.Must(viper.BindEnv(allocationBatchWaitTime))
+	runtime.Must(viper.BindEnv(podNamespace))
+	runtime.Must(viper.BindEnv(leaderElectionFlag))
 	runtime.Must(viper.BindPFlags(pflag.CommandLine))
+	runtime.Must(cloudproduct.BindEnv())
 	runtime.Must(runtime.FeaturesBindEnv())
 
 	runtime.Must(runtime.ParseFeaturesFromEnv())
@@ -364,6 +379,8 @@ func parseEnvFlags() config {
 		LogSizeLimitMB:          int(viper.GetInt32(logSizeLimitMBFlag)),
 		StackdriverLabels:       viper.GetString(stackdriverLabels),
 		AllocationBatchWaitTime: viper.GetDuration(allocationBatchWaitTime),
+		PodNamespace:            viper.GetString(podNamespace),
+		LeaderElection:          viper.GetBool(leaderElectionFlag),
 	}
 }
 
@@ -392,6 +409,8 @@ type config struct {
 	LogLevel                string
 	LogSizeLimitMB          int
 	AllocationBatchWaitTime time.Duration
+	PodNamespace            string
+	LeaderElection          bool
 }
 
 // validate ensures the ctlConfig data is valid.
@@ -403,10 +422,30 @@ func (c *config) validate() []error {
 	if c.MaxPort < c.MinPort {
 		validationErrors = append(validationErrors, errors.New("max Port cannot be set less that the Min Port"))
 	}
-	resourceErrors := agonesv1.ValidateResource(c.SidecarCPURequest, c.SidecarCPULimit, corev1.ResourceCPU)
+	resourceErrors := validateResource(c.SidecarCPURequest, c.SidecarCPULimit, corev1.ResourceCPU)
 	validationErrors = append(validationErrors, resourceErrors...)
-	resourceErrors = agonesv1.ValidateResource(c.SidecarMemoryRequest, c.SidecarMemoryLimit, corev1.ResourceMemory)
+	resourceErrors = validateResource(c.SidecarMemoryRequest, c.SidecarMemoryLimit, corev1.ResourceMemory)
 	validationErrors = append(validationErrors, resourceErrors...)
+	return validationErrors
+}
+
+// validateResource validates limit or Memory CPU resources used for containers in pods
+// If a GameServer is invalid there will be > 0 values in
+// the returned array
+//
+// Moved from agones.dev/agones/pkg/apis/agones/v1 (#3255)
+func validateResource(request resource.Quantity, limit resource.Quantity, resourceName corev1.ResourceName) []error {
+	validationErrors := make([]error, 0)
+	if !limit.IsZero() && request.Cmp(limit) > 0 {
+		validationErrors = append(validationErrors, errors.Errorf("Request must be less than or equal to %s limit", resourceName))
+	}
+	if request.Cmp(resource.Quantity{}) < 0 {
+		validationErrors = append(validationErrors, errors.Errorf("Resource %s request value must be non negative", resourceName))
+	}
+	if limit.Cmp(resource.Quantity{}) < 0 {
+		validationErrors = append(validationErrors, errors.Errorf("Resource %s limit value must be non negative", resourceName))
+	}
+
 	return validationErrors
 }
 
@@ -416,6 +455,56 @@ type runner interface {
 
 type httpServer struct {
 	http.ServeMux
+}
+
+func whenLeader(ctx context.Context, cancel context.CancelFunc, logger *logrus.Entry, doLeaderElection bool, kubeClient *kubernetes.Clientset, namespace string, start func(_ context.Context)) {
+	if !doLeaderElection {
+		start(ctx)
+		return
+	}
+
+	id := uuid.New().String()
+
+	lock := &resourcelock.LeaseLock{
+		LeaseMeta: metav1.ObjectMeta{
+			Name:      "agones-controller-lock",
+			Namespace: namespace,
+		},
+		Client: kubeClient.CoordinationV1(),
+		LockConfig: resourcelock.ResourceLockConfig{
+			Identity: id,
+		},
+	}
+
+	logger.WithField("id", id).Info("Leader Election ID")
+
+	leaderelection.RunOrDie(ctx, leaderelection.LeaderElectionConfig{
+		Lock: lock,
+		// IMPORTANT: you MUST ensure that any code you have that
+		// is protected by the lease must terminate **before**
+		// you call cancel. Otherwise, you could have a background
+		// loop still running and another process could
+		// get elected before your background loop finished, violating
+		// the stated goal of the lease.
+		ReleaseOnCancel: true,
+		LeaseDuration:   15 * time.Second,
+		RenewDeadline:   10 * time.Second,
+		RetryPeriod:     2 * time.Second,
+		Callbacks: leaderelection.LeaderCallbacks{
+			OnStartedLeading: start,
+			OnStoppedLeading: func() {
+				logger.WithField("id", id).Info("Leader Lost")
+				cancel()
+				os.Exit(0)
+			},
+			OnNewLeader: func(identity string) {
+				if identity == id {
+					return
+				}
+				logger.WithField("id", id).Info("New Leader Elected")
+			},
+		},
+	})
 }
 
 func (h *httpServer) Run(_ context.Context, _ int) error {

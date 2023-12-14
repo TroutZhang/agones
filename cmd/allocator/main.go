@@ -26,9 +26,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/spf13/pflag"
-	"github.com/spf13/viper"
-
 	"agones.dev/agones/pkg"
 	"agones.dev/agones/pkg/allocation/converters"
 	pb "agones.dev/agones/pkg/allocation/go"
@@ -37,19 +34,20 @@ import (
 	"agones.dev/agones/pkg/client/informers/externalversions"
 	"agones.dev/agones/pkg/gameserverallocations"
 	"agones.dev/agones/pkg/gameservers"
+	"agones.dev/agones/pkg/util/fswatch"
 	"agones.dev/agones/pkg/util/runtime"
 	"agones.dev/agones/pkg/util/signals"
-	gw_runtime "github.com/grpc-ecosystem/grpc-gateway/runtime"
 	"github.com/heptiolabs/healthcheck"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
+	"github.com/spf13/pflag"
+	"github.com/spf13/viper"
 	"go.opencensus.io/plugin/ocgrpc"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/status"
-	"gopkg.in/fsnotify.v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	k8sruntime "k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/informers"
@@ -57,7 +55,10 @@ import (
 	"k8s.io/client-go/rest"
 )
 
-var logger = runtime.NewLoggerWithSource("main")
+var (
+	podReady bool
+	logger   = runtime.NewLoggerWithSource("main")
+)
 
 const (
 	certDir = "/home/allocator/client-ca/"
@@ -79,6 +80,7 @@ const (
 	apiServerBurstQPSFlag            = "api-server-qps-burst"
 	logLevelFlag                     = "log-level"
 	allocationBatchWaitTime          = "allocation-batch-wait-time"
+	readinessShutdownDuration        = "readiness-shutdown-duration"
 )
 
 func parseEnvFlags() config {
@@ -111,6 +113,7 @@ func parseEnvFlags() config {
 	pflag.Duration(totalRemoteAllocationTimeoutFlag, viper.GetDuration(totalRemoteAllocationTimeoutFlag), "Flag to set total remote allocation timeout including retries.")
 	pflag.String(logLevelFlag, viper.GetString(logLevelFlag), "Agones Log level")
 	pflag.Duration(allocationBatchWaitTime, viper.GetDuration(allocationBatchWaitTime), "Flag to configure the waiting period between allocations batches")
+	pflag.Duration(readinessShutdownDuration, viper.GetDuration(readinessShutdownDuration), "Time in seconds for SIGTERM/SIGINT handler to sleep for.")
 	runtime.FeaturesBindFlags()
 	pflag.Parse()
 
@@ -129,6 +132,7 @@ func parseEnvFlags() config {
 	runtime.Must(viper.BindEnv(totalRemoteAllocationTimeoutFlag))
 	runtime.Must(viper.BindEnv(logLevelFlag))
 	runtime.Must(viper.BindEnv(allocationBatchWaitTime))
+	runtime.Must(viper.BindEnv(readinessShutdownDuration))
 	runtime.Must(viper.BindPFlags(pflag.CommandLine))
 	runtime.Must(runtime.FeaturesBindEnv())
 
@@ -149,6 +153,7 @@ func parseEnvFlags() config {
 		remoteAllocationTimeout:      viper.GetDuration(remoteAllocationTimeoutFlag),
 		totalRemoteAllocationTimeout: viper.GetDuration(totalRemoteAllocationTimeoutFlag),
 		allocationBatchWaitTime:      viper.GetDuration(allocationBatchWaitTime),
+		ReadinessShutdownDuration:    viper.GetDuration(readinessShutdownDuration),
 	}
 }
 
@@ -167,6 +172,7 @@ type config struct {
 	totalRemoteAllocationTimeout time.Duration
 	remoteAllocationTimeout      time.Duration
 	allocationBatchWaitTime      time.Duration
+	ReadinessShutdownDuration    time.Duration
 }
 
 // grpcHandlerFunc returns an http.Handler that delegates to grpcServer on incoming gRPC
@@ -216,78 +222,63 @@ func main() {
 	// This will test the connection to agones on each readiness probe
 	// so if one of the allocator pod can't reach Kubernetes it will be removed
 	// from the Kubernetes service.
+	ctx, cancelCtx := context.WithCancel(context.Background())
+	podReady = true
 	health.AddReadinessCheck("allocator-agones-client", func() error {
+		if !podReady {
+			return errors.New("asked to shut down, failed readiness check")
+		}
 		_, err := agonesClient.ServerVersion()
-		return err
+		if err != nil {
+			return fmt.Errorf("failed to reach Kubernetes: %w", err)
+		}
+		return nil
 	})
 
-	h := newServiceHandler(kubeClient, agonesClient, health, conf.MTLSDisabled, conf.TLSDisabled, conf.remoteAllocationTimeout, conf.totalRemoteAllocationTimeout, conf.allocationBatchWaitTime)
+	signals.NewSigTermHandler(func() {
+		logger.Info("Pod shutdown has been requested, failing readiness check")
+		podReady = false
+		time.Sleep(conf.ReadinessShutdownDuration)
+		cancelCtx()
+		logger.Infof("Readiness shutdown duration has passed, exiting pod")
+		os.Exit(0)
+	})
+
+	h := newServiceHandler(ctx, kubeClient, agonesClient, health, conf.MTLSDisabled, conf.TLSDisabled, conf.remoteAllocationTimeout, conf.totalRemoteAllocationTimeout, conf.allocationBatchWaitTime)
 
 	if !h.tlsDisabled {
-		watcherTLS, err := fsnotify.NewWatcher()
-		if err != nil {
-			logger.WithError(err).Fatal("could not create watcher for tls certs")
-		}
-		defer watcherTLS.Close() // nolint: errcheck
-		if err := watcherTLS.Add(tlsDir); err != nil {
-			logger.WithError(err).Fatalf("cannot watch folder %s for secret changes", tlsDir)
-		}
-
-		// Watching for the events in certificate directory for updating certificates, when there is a change
-		go func() {
-			for {
-				select {
-				// watch for events
-				case event := <-watcherTLS.Events:
-					tlsCert, err := readTLSCert()
-					if err != nil {
-						logger.WithError(err).Error("could not load TLS cert; keeping old one")
-					} else {
-						h.tlsMutex.Lock()
-						h.tlsCert = tlsCert
-						h.tlsMutex.Unlock()
-					}
-					logger.Infof("Tls directory change event %v", event)
-
-				// watch for errors
-				case err := <-watcherTLS.Errors:
-					logger.WithError(err).Error("error watching for TLS directory")
-				}
+		cancelTLS, err := fswatch.Watch(logger, tlsDir, time.Second, func() {
+			tlsCert, err := readTLSCert()
+			if err != nil {
+				logger.WithError(err).Error("could not load TLS certs; keeping old one")
+				return
 			}
-		}()
+			h.tlsMutex.Lock()
+			defer h.tlsMutex.Unlock()
+			h.tlsCert = tlsCert
+			logger.Info("TLS certs updated")
+		})
+		if err != nil {
+			logger.WithError(err).Fatal("could not create watcher for TLS certs")
+		}
+		defer cancelTLS()
 
 		if !h.mTLSDisabled {
-			// creates a new file watcher for client certificate folder
-			watcher, err := fsnotify.NewWatcher()
-			if err != nil {
-				logger.WithError(err).Fatal("could not create watcher for client certs")
-			}
-			defer watcher.Close() // nolint: errcheck
-			if err := watcher.Add(certDir); err != nil {
-				logger.WithError(err).Fatalf("cannot watch folder %s for secret changes", certDir)
-			}
-
-			go func() {
-				for {
-					select {
-					// watch for events
-					case event := <-watcher.Events:
-						h.certMutex.Lock()
-						caCertPool, err := getCACertPool(certDir)
-						if err != nil {
-							logger.WithError(err).Error("could not load CA certs; keeping old ones")
-						} else {
-							h.caCertPool = caCertPool
-						}
-						logger.Infof("Certificate directory change event %v", event)
-						h.certMutex.Unlock()
-
-					// watch for errors
-					case err := <-watcher.Errors:
-						logger.WithError(err).Error("error watching for certificate directory")
-					}
+			cancelCert, err := fswatch.Watch(logger, certDir, time.Second, func() {
+				h.certMutex.Lock()
+				defer h.certMutex.Unlock()
+				caCertPool, err := getCACertPool(certDir)
+				if err != nil {
+					logger.WithError(err).Error("could not load CA certs; keeping old ones")
+					return
 				}
-			}()
+				h.caCertPool = caCertPool
+				logger.Info("CA certs updated")
+			})
+			if err != nil {
+				logger.WithError(err).Fatal("could not create watcher for CA certs")
+			}
+			defer cancelCert()
 		}
 	}
 
@@ -320,7 +311,7 @@ func runMux(h *serviceHandler, httpPort int) {
 	grpcServer := grpc.NewServer(h.getMuxServerOptions()...)
 	pb.RegisterAllocationServiceServer(grpcServer, h)
 
-	mux := gw_runtime.NewServeMux()
+	mux := runtime.NewServerMux()
 	if err := pb.RegisterAllocationServiceHandlerServer(context.Background(), mux, h); err != nil {
 		panic(err)
 	}
@@ -330,7 +321,7 @@ func runMux(h *serviceHandler, httpPort int) {
 
 func runREST(h *serviceHandler, httpPort int) {
 	logger.WithField("port", httpPort).Info("Running the rest handler")
-	mux := gw_runtime.NewServeMux()
+	mux := runtime.NewServerMux()
 	if err := pb.RegisterAllocationServiceHandlerServer(context.Background(), mux, h); err != nil {
 		panic(err)
 	}
@@ -387,7 +378,7 @@ func runGRPC(h *serviceHandler, grpcPort int) {
 	}()
 }
 
-func newServiceHandler(kubeClient kubernetes.Interface, agonesClient versioned.Interface, health healthcheck.Handler, mTLSDisabled bool, tlsDisabled bool, remoteAllocationTimeout time.Duration, totalRemoteAllocationTimeout time.Duration, allocationBatchWaitTime time.Duration) *serviceHandler {
+func newServiceHandler(ctx context.Context, kubeClient kubernetes.Interface, agonesClient versioned.Interface, health healthcheck.Handler, mTLSDisabled bool, tlsDisabled bool, remoteAllocationTimeout time.Duration, totalRemoteAllocationTimeout time.Duration, allocationBatchWaitTime time.Duration) *serviceHandler {
 	defaultResync := 30 * time.Second
 	agonesInformerFactory := externalversions.NewSharedInformerFactory(agonesClient, defaultResync)
 	kubeInformerFactory := informers.NewSharedInformerFactory(kubeClient, defaultResync)
@@ -403,7 +394,6 @@ func newServiceHandler(kubeClient kubernetes.Interface, agonesClient versioned.I
 		totalRemoteAllocationTimeout,
 		allocationBatchWaitTime)
 
-	ctx := signals.NewSigKillContext()
 	h := serviceHandler{
 		allocationCallback: func(gsa *allocationv1.GameServerAllocation) (k8sruntime.Object, error) {
 			return allocator.Allocate(ctx, gsa)

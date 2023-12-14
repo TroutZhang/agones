@@ -34,6 +34,8 @@ import (
 // Ready GameServers currently exist on each node.
 // This is useful for scheduling allocations, fleet management
 // mostly under a Packed strategy
+//
+//nolint:govet // ignore fieldalignment, singleton
 type PerNodeCounter struct {
 	logger           *logrus.Entry
 	gameServerSynced cache.InformerSynced
@@ -68,7 +70,7 @@ func NewPerNodeCounter(
 
 	ac.logger = runtime.NewLoggerWithType(ac)
 
-	gsInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+	_, _ = gsInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
 			gs := obj.(*agonesv1.GameServer)
 
@@ -116,7 +118,7 @@ func NewPerNodeCounter(
 	})
 
 	// remove the record when the node is deleted
-	kubeInformerFactory.Core().V1().Nodes().Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+	_, _ = kubeInformerFactory.Core().V1().Nodes().Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
 		DeleteFunc: func(obj interface{}) {
 			node, ok := obj.(*corev1.Node)
 			if !ok {

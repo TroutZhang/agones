@@ -21,8 +21,9 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/assert"
-	"k8s.io/apimachinery/pkg/util/clock"
 	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/utils/clock"
+	testclocks "k8s.io/utils/clock/testing"
 )
 
 type mockAddr struct {
@@ -40,7 +41,7 @@ func (m *mockAddr) String() string {
 func TestUDPServerVisit(t *testing.T) {
 	t.Parallel()
 
-	fc := clock.NewFakeClock(time.Now())
+	fc := testclocks.NewFakeClock(time.Now())
 	u, err := defaultFixture(fc)
 	assert.Nil(t, err)
 	defer u.close()
@@ -72,7 +73,7 @@ func TestUDPServerVisit(t *testing.T) {
 func TestUDPServerCleanup(t *testing.T) {
 	t.Parallel()
 
-	fc := clock.NewFakeClock(time.Now())
+	fc := testclocks.NewFakeClock(time.Now())
 	u, err := defaultFixture(fc)
 	assert.Nil(t, err)
 	defer u.close()
@@ -99,7 +100,7 @@ func TestUDPServerCleanup(t *testing.T) {
 func TestUDPServerHealth(t *testing.T) {
 	t.Parallel()
 
-	fc := clock.NewFakeClock(time.Now())
+	fc := testclocks.NewFakeClock(time.Now())
 	u, err := defaultFixture(fc)
 	assert.Nil(t, err)
 	defer u.close()
@@ -113,14 +114,14 @@ func TestUDPServerHealth(t *testing.T) {
 
 	cancel()
 
-	err = wait.PollImmediate(time.Second, 5*time.Second, func() (done bool, err error) {
+	err = wait.PollUntilContextTimeout(context.Background(), time.Second, 5*time.Second, true, func(ctx context.Context) (bool, error) {
 		return u.Health() != nil, nil
 	})
 
 	assert.Nil(t, err)
 }
 
-func defaultFixture(cl clock.Clock) (*udpServer, error) {
+func defaultFixture(cl clock.WithTickerAndDelayedExecution) (*udpServer, error) {
 	u := newUDPServer(5)
 	u.clock = cl
 	var err error

@@ -48,9 +48,28 @@ spec:
 {{- toYaml .Values.agones.ping.annotations | nindent 8 }}
 {{- end }}
     spec:
-      {{- if .Values.agones.ping.affinity }}
       affinity:
+      {{- if .Values.agones.ping.affinity }}
+      {{- if .Values.agones.requireDedicatedNodes }}
+      {{- fail "agones.ping.affinity and agones.requireDedicatedNodes cannot be set at the same time!" }}
+      {{- end}}
+      {{- end}}
+      {{- if .Values.agones.ping.affinity }}
 {{ toYaml .Values.agones.ping.affinity | indent 8 }}
+      {{- else}}
+        nodeAffinity:
+          {{- if .Values.agones.requireDedicatedNodes }}
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+          {{- else}}
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 1
+            preference:
+              matchExpressions:
+          {{- end }}
+              - key: agones.dev/agones-system
+                operator: Exists
       {{- end }}
       {{- if .Values.agones.ping.nodeSelector }}
       nodeSelector:
@@ -90,6 +109,27 @@ spec:
       imagePullSecrets:
         - name: {{.Values.agones.image.controller.pullSecret}}
 {{- end }}
+{{- if .Values.agones.ping.pdb.enabled }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: agones-ping-pdb
+spec:
+{{- if .Values.agones.ping.pdb.minAvailable }}
+{{- if .Values.agones.ping.pdb.maxUnavailable }}
+{{- fail "minAvailable and maxUnavailable are mutually exclusive!" }}
+{{- end}}
+{{- end}}
+  minAvailable: {{ .Values.agones.ping.pdb.minAvailable }}
+  maxUnavailable: {{ .Values.agones.ping.pdb.maxUnavailable }}
+  selector:
+    matchLabels:
+      agones.dev/role: ping
+      app: {{ template "agones.name" . }}
+      release: {{ .Release.Name }}
+      heritage: {{ .Release.Service }}
+{{- end }}
   {{- if .Values.agones.ping.http.expose }}
 ---
 apiVersion: v1
@@ -114,6 +154,9 @@ spec:
     - port: {{ .Values.agones.ping.http.port }}
       name: http
       targetPort: 8080
+      {{- if eq .Values.agones.ping.http.serviceType "NodePort" }}
+      nodePort: {{ .Values.agones.ping.http.nodePort }}
+      {{- end }}
       protocol: TCP
   type: {{ .Values.agones.ping.http.serviceType }}
 {{- if eq .Values.agones.ping.http.serviceType "LoadBalancer" }}
@@ -152,6 +195,9 @@ spec:
       name: udp
       targetPort: 8080
       protocol: UDP
+      {{- if eq .Values.agones.ping.udp.serviceType "NodePort" }}
+      nodePort: {{ .Values.agones.ping.udp.nodePort }}
+      {{- end }}
   type: {{ .Values.agones.ping.udp.serviceType }}
 {{- if eq .Values.agones.ping.udp.serviceType "LoadBalancer" }}
   {{- if .Values.agones.ping.udp.loadBalancerIP }}

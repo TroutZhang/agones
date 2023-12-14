@@ -18,7 +18,7 @@
 #include "Components/ActorComponent.h"
 #include "CoreMinimal.h"
 #include "Interfaces/IHttpRequest.h"
-#include "WebSockets/Public/IWebSocket.h"
+#include "IWebSocket.h"
 
 #include "AgonesComponent.generated.h"
 
@@ -308,7 +308,7 @@ private:
 
 	TSharedPtr<IWebSocket> WatchWebSocket;
 
-	FString WatchMessageBuffer;
+	TArray<UTF8CHAR> WatchMessageBuffer;
 
 	TArray<FGameServerDelegate> WatchGameServerCallbacks;
 	

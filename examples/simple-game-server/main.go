@@ -36,7 +36,7 @@ import (
 
 // main starts a UDP or TCP server
 func main() {
-	go doSignal()
+	sigCtx, _ := signals.NewSigKillContext()
 
 	port := flag.String("port", "7654", "The port to listen to traffic on")
 	passthrough := flag.Bool("passthrough", false, "Get listening port from the SDK, rather than use the 'port' value")
@@ -45,6 +45,7 @@ func main() {
 	shutdownDelaySec := flag.Int("automaticShutdownDelaySec", 0, "If greater than zero, automatically shut down the server this many seconds after the server becomes allocated (cannot be used if automaticShutdownDelayMin is set)")
 	readyDelaySec := flag.Int("readyDelaySec", 0, "If greater than zero, wait this many seconds each time before marking the game server as ready")
 	readyIterations := flag.Int("readyIterations", 0, "If greater than zero, return to a ready state this number of times before shutting down")
+	gracefulTerminationDelaySec := flag.Int("gracefulTerminationDelaySec", 0, "Delay after we've been asked to terminate (by SIGKILL or automaticShutdownDelaySec)")
 	udp := flag.Bool("udp", true, "Server will listen on UDP")
 	tcp := flag.Bool("tcp", false, "Server will listen on TCP")
 
@@ -121,16 +122,9 @@ func main() {
 		ready(s)
 	}
 
-	// Prevent the program from quitting as the server is listening on goroutines.
-	for {
-	}
-}
-
-// doSignal shutsdown on SIGTERM/SIGKILL
-func doSignal() {
-	ctx := signals.NewSigKillContext()
-	<-ctx.Done()
-	log.Println("Exit signal received. Shutting down.")
+	<-sigCtx.Done()
+	log.Printf("Waiting %d seconds before exiting", *gracefulTerminationDelaySec)
+	time.Sleep(time.Duration(*gracefulTerminationDelaySec) * time.Second)
 	os.Exit(0)
 }
 
@@ -140,8 +134,8 @@ func doSignal() {
 //
 // The algorithm is:
 //
-//   1. Move the game server back to ready N times after it is allocated
-//   2. Shutdown the game server after the Nth time is becomes allocated
+//  1. Move the game server back to ready N times after it is allocated
+//  2. Shutdown the game server after the Nth time is becomes allocated
 //
 // This follows the integration pattern documented on the website at
 // https://agones.dev/site/docs/integration-patterns/reusing-gameservers/
@@ -312,8 +306,124 @@ func handleResponse(txt string, s *sdk.SDK, cancel context.CancelFunc) (response
 	case "PLAYER_COUNT":
 		response = getPlayerCount(s)
 		addACK = false
-	}
 
+	case "GET_COUNTER_COUNT":
+		if len(parts) < 2 {
+			response = "Invalid GET_COUNTER_COUNT, should have 1 arguments"
+			responseError = fmt.Errorf("Invalid GET_COUNTER_COUNT, should have 1 arguments")
+			return
+		}
+		response, responseError = getCounterCount(s, parts[1])
+		addACK = false
+
+	case "INCREMENT_COUNTER":
+		if len(parts) < 3 {
+			response = "Invalid INCREMENT_COUNTER, should have 2 arguments"
+			responseError = fmt.Errorf("Invalid INCREMENT_COUNTER, should have 2 arguments")
+			return
+		}
+		response, responseError = incrementCounter(s, parts[1], parts[2])
+		addACK = false
+
+	case "DECREMENT_COUNTER":
+		if len(parts) < 3 {
+			response = "Invalid DECREMENT_COUNTER, should have 2 arguments"
+			responseError = fmt.Errorf("Invalid DECREMENT_COUNTER, should have 2 arguments")
+			return
+		}
+		response, responseError = decrementCounter(s, parts[1], parts[2])
+		addACK = false
+
+	case "SET_COUNTER_COUNT":
+		if len(parts) < 3 {
+			response = "Invalid SET_COUNTER_COUNT, should have 2 arguments"
+			responseError = fmt.Errorf("Invalid SET_COUNTER_COUNT, should have 2 arguments")
+			return
+		}
+		response, responseError = setCounterCount(s, parts[1], parts[2])
+		addACK = false
+
+	case "GET_COUNTER_CAPACITY":
+		if len(parts) < 2 {
+			response = "Invalid GET_COUNTER_CAPACITY, should have 1 arguments"
+			responseError = fmt.Errorf("Invalid GET_COUNTER_CAPACITY, should have 1 arguments")
+			return
+		}
+		response, responseError = getCounterCapacity(s, parts[1])
+		addACK = false
+
+	case "SET_COUNTER_CAPACITY":
+		if len(parts) < 3 {
+			response = "Invalid SET_COUNTER_CAPACITY, should have 2 arguments"
+			responseError = fmt.Errorf("Invalid SET_COUNTER_CAPACITY, should have 2 arguments")
+			return
+		}
+		response, responseError = setCounterCapacity(s, parts[1], parts[2])
+		addACK = false
+
+	case "GET_LIST_CAPACITY":
+		if len(parts) < 2 {
+			response = "Invalid GET_LIST_CAPACITY, should have 1 arguments"
+			responseError = fmt.Errorf("Invalid GET_LIST_CAPACITY, should have 1 arguments")
+			return
+		}
+		response, responseError = getListCapacity(s, parts[1])
+		addACK = false
+
+	case "SET_LIST_CAPACITY":
+		if len(parts) < 3 {
+			response = "Invalid SET_LIST_CAPACITY, should have 2 arguments"
+			responseError = fmt.Errorf("Invalid SET_LIST_CAPACITY, should have 2 arguments")
+			return
+		}
+		response, responseError = setListCapacity(s, parts[1], parts[2])
+		addACK = false
+
+	case "LIST_CONTAINS":
+		if len(parts) < 3 {
+			response = "Invalid LIST_CONTAINS, should have 2 arguments"
+			responseError = fmt.Errorf("Invalid LIST_CONTAINS, should have 2 arguments")
+			return
+		}
+		response, responseError = listContains(s, parts[1], parts[2])
+		addACK = false
+
+	case "GET_LIST_LENGTH":
+		if len(parts) < 2 {
+			response = "Invalid GET_LIST_LENGTH, should have 1 arguments"
+			responseError = fmt.Errorf("Invalid GET_LIST_LENGTH, should have 1 arguments")
+			return
+		}
+		response, responseError = getListLength(s, parts[1])
+		addACK = false
+
+	case "GET_LIST_VALUES":
+		if len(parts) < 2 {
+			response = "Invalid GET_LIST_VALUES, should have 1 arguments"
+			responseError = fmt.Errorf("Invalid GET_LIST_VALUES, should have 1 arguments")
+			return
+		}
+		response, responseError = getListValues(s, parts[1])
+		addACK = false
+
+	case "APPEND_LIST_VALUE":
+		if len(parts) < 3 {
+			response = "Invalid APPEND_LIST_VALUE, should have 2 arguments"
+			responseError = fmt.Errorf("Invalid APPEND_LIST_VALUE, should have 2 arguments")
+			return
+		}
+		response, responseError = appendListValue(s, parts[1], parts[2])
+		addACK = false
+
+	case "DELETE_LIST_VALUE":
+		if len(parts) < 3 {
+			response = "Invalid DELETE_LIST_VALUE, should have 2 arguments"
+			responseError = fmt.Errorf("Invalid DELETE_LIST_VALUE, should have 2 arguments")
+			return
+		}
+		response, responseError = deleteListValue(s, parts[1], parts[2])
+		addACK = false
+	}
 	return
 }
 
@@ -569,6 +679,156 @@ func getPlayerCount(s *sdk.SDK) string {
 		log.Fatalf("could not retrieve player count: %s", err)
 	}
 	return strconv.FormatInt(count, 10) + "\n"
+}
+
+// getCounterCount returns the Count of the given Counter as a string
+func getCounterCount(s *sdk.SDK, counterName string) (string, error) {
+	log.Printf("Retrieving Counter %s Count", counterName)
+	count, err := s.Alpha().GetCounterCount(counterName)
+	if err != nil {
+		log.Printf("Error getting Counter %s Count: %s", counterName, err)
+	}
+	return strconv.FormatInt(count, 10), err
+}
+
+// incrementCounter returns the if the Counter Count was incremented successfully (true) or not (false)
+func incrementCounter(s *sdk.SDK, counterName string, amount string) (string, error) {
+	amountInt, err := strconv.ParseInt(amount, 10, 64)
+	if err != nil {
+		return "false", fmt.Errorf("could not increment Counter %s by unparseable amount %s: %s", counterName, amount, err)
+	}
+	log.Printf("Incrementing Counter %s Count by amount %d", counterName, amountInt)
+	ok, err := s.Alpha().IncrementCounter(counterName, amountInt)
+	if err != nil {
+		log.Printf("Error incrementing Counter %s Count by amount %d: %s", counterName, amountInt, err)
+	}
+	return strconv.FormatBool(ok), err
+}
+
+// decrementCounter returns the if the Counter Count was decremented successfully (true) or not (false)
+func decrementCounter(s *sdk.SDK, counterName string, amount string) (string, error) {
+	amountInt, err := strconv.ParseInt(amount, 10, 64)
+	if err != nil {
+		return "false", fmt.Errorf("could not decrement Counter %s by unparseable amount %s: %s", counterName, amount, err)
+	}
+	log.Printf("Decrementing Counter %s Count by amount %d", counterName, amountInt)
+	ok, err := s.Alpha().DecrementCounter(counterName, amountInt)
+	if err != nil {
+		log.Printf("Error decrementing Counter %s Count by amount %d: %s", counterName, amountInt, err)
+	}
+	return strconv.FormatBool(ok), err
+}
+
+// setCounterCount returns the if the Counter was set to a new Count successfully (true) or not (false)
+func setCounterCount(s *sdk.SDK, counterName string, amount string) (string, error) {
+	amountInt, err := strconv.ParseInt(amount, 10, 64)
+	if err != nil {
+		return "false", fmt.Errorf("could not set Counter %s to unparseable amount %s: %s", counterName, amount, err)
+	}
+	log.Printf("Setting Counter %s Count to amount %d", counterName, amountInt)
+	ok, err := s.Alpha().SetCounterCount(counterName, amountInt)
+	if err != nil {
+		log.Printf("Error setting Counter %s Count by amount %d: %s", counterName, amountInt, err)
+	}
+	return strconv.FormatBool(ok), err
+}
+
+// getCounterCapacity returns the Capacity of the given Counter as a string
+func getCounterCapacity(s *sdk.SDK, counterName string) (string, error) {
+	log.Printf("Retrieving Counter %s Capacity", counterName)
+	count, err := s.Alpha().GetCounterCapacity(counterName)
+	if err != nil {
+		log.Printf("Error getting Counter %s Capacity: %s", counterName, err)
+	}
+	return strconv.FormatInt(count, 10), err
+}
+
+// setCounterCapacity returns the if the Counter was set to a new Capacity successfully (true) or not (false)
+func setCounterCapacity(s *sdk.SDK, counterName string, amount string) (string, error) {
+	amountInt, err := strconv.ParseInt(amount, 10, 64)
+	if err != nil {
+		return "false", fmt.Errorf("could not set Counter %s to unparseable amount %s: %s", counterName, amount, err)
+	}
+	log.Printf("Setting Counter %s Capacity to amount %d", counterName, amountInt)
+	ok, err := s.Alpha().SetCounterCapacity(counterName, amountInt)
+	if err != nil {
+		log.Printf("Error setting Counter %s Capacity to amount %d: %s", counterName, amountInt, err)
+	}
+	return strconv.FormatBool(ok), err
+}
+
+// getListCapacity returns the Capacity of the given List as a string
+func getListCapacity(s *sdk.SDK, listName string) (string, error) {
+	log.Printf("Retrieving List %s Capacity", listName)
+	capacity, err := s.Alpha().GetListCapacity(listName)
+	if err != nil {
+		log.Printf("Error getting List %s Capacity: %s", listName, err)
+	}
+	return strconv.FormatInt(capacity, 10), err
+}
+
+// setListCapacity returns if the List was set to a new Capacity successfully (true) or not (false)
+func setListCapacity(s *sdk.SDK, listName string, amount string) (string, error) {
+	amountInt, err := strconv.ParseInt(amount, 10, 64)
+	if err != nil {
+		return "false", fmt.Errorf("could not set List %s to unparseable amount %s: %s", listName, amount, err)
+	}
+	log.Printf("Setting List %s Capacity to amount %d", listName, amountInt)
+	ok, err := s.Alpha().SetListCapacity(listName, amountInt)
+	if err != nil {
+		log.Printf("Error setting List %s Capacity to amount %d: %s", listName, amountInt, err)
+	}
+	return strconv.FormatBool(ok), err
+}
+
+// listContains returns true if the given value is in the given List, false otherwise
+func listContains(s *sdk.SDK, listName string, value string) (string, error) {
+	log.Printf("Getting List %s contains value %s", listName, value)
+	ok, err := s.Alpha().ListContains(listName, value)
+	if err != nil {
+		log.Printf("Error getting List %s contains value %s: %s", listName, value, err)
+	}
+	return strconv.FormatBool(ok), err
+}
+
+// getListLength returns the length (number of values) of the given List as a string
+func getListLength(s *sdk.SDK, listName string) (string, error) {
+	log.Printf("Getting List %s length", listName)
+	length, err := s.Alpha().GetListLength(listName)
+	if err != nil {
+		log.Printf("Error getting List %s length: %s", listName, err)
+	}
+	return strconv.Itoa(length), err
+}
+
+// getListValues return the values in the given List as a comma delineated string
+func getListValues(s *sdk.SDK, listName string) (string, error) {
+	log.Printf("Getting List %s values", listName)
+	values, err := s.Alpha().GetListValues(listName)
+	if err != nil {
+		log.Printf("Error getting List %s values: %s", listName, err)
+	}
+	return strings.Join(values, ",") + "\n", err
+}
+
+// appendListValue returns if the given value was successfuly added to the List (true) or not (false)
+func appendListValue(s *sdk.SDK, listName string, value string) (string, error) {
+	log.Printf("Appending Value %s to List %s", value, listName)
+	ok, err := s.Alpha().AppendListValue(listName, value)
+	if err != nil {
+		log.Printf("Error appending Value %s to List %s: %s", value, listName, err)
+	}
+	return strconv.FormatBool(ok), err
+}
+
+// deleteListValue returns if the given value was successfuly deleted from the List (true) or not (false)
+func deleteListValue(s *sdk.SDK, listName string, value string) (string, error) {
+	log.Printf("Deleting Value %s from List %s", value, listName)
+	ok, err := s.Alpha().DeleteListValue(listName, value)
+	if err != nil {
+		log.Printf("Error deleting Value %s to List %s: %s", value, listName, err)
+	}
+	return strconv.FormatBool(ok), err
 }
 
 // doHealth sends the regular Health Pings

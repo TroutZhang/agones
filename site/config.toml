@@ -1,4 +1,4 @@
-# Copyright 2018 Google LLC All Rights Reserved.
+# Copyright 2023 Google LLC All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -16,9 +16,6 @@ baseURL = "/site/"
 title = "Agones"
 enableRobotsTXT = true
 
-# Hugo allows theme composition (and inheritance). The precedence is from left to right.
-theme = ["docsy"]
-
 # Will give values to .Lastmod etc.
 enableGitInfo = true
 
@@ -29,7 +26,7 @@ defaultContentLanguageInSubdir = false
 # Useful when translating.
 enableMissingTranslationPlaceholders = true
 
-disableKinds = ["taxonomy", "taxonomyTerm"]
+disableKinds = ["taxonomy"]
 
 # Highlighting config
 pygmentsCodeFences = true
@@ -59,17 +56,18 @@ anchor = "smart"
 [services]
 [services.googleAnalytics]
 # Comment out the next line to disable GA tracking. Also disables the feature described in [params.ui.feedback].
-id = "UA-132708785-1"
+id = "G-TK6J08ZNYX"
 
 # Language configuration
 
 [languages]
 [languages.en]
 title = "Agones"
-description = "Agones is a library for hosting, running and scaling dedicated game servers on Kubernetes."
 languageName ="English"
 # Weight used for sorting.
 weight = 1
+[languages.en.params]
+description = "Agones is a library for hosting, running and scaling dedicated game servers on Kubernetes."
 
 # Everything below this are Site Params
 
@@ -82,21 +80,27 @@ github_repo = "https://github.com/googleforgames/agones"
 gcs_engine_id = "016691298986124624340:x7qv2dywdao"
 
 # current release branch. Never is rc.
-release_branch = "release-1.26.0"
+release_branch = "release-1.36.0"
 # the main version. Never is rc.
-release_version = "1.26.0"
+release_version = "1.36.0"
 
 # shown for production
-supported_k8s = "1.23"
-aks_minor_supported_k8s = "8"
-minikube_minor_supported_k8s = "9"
-# shown in development (or the next version that will be supported)
-dev_supported_k8s = "1.23"
-dev_aks_minor_supported_k8s = "8"
-dev_minikube_minor_supported_k8s = "9"
+supported_k8s = ["1.26", "1.27", "1.28"]
+k8s_api_version = "1.27"
+gke_example_cluster_version = "1.27"
+aks_example_cluster_version = "1.28.0"
+eks_example_cluster_version = "1.28"
+minikube_example_cluster_version = "1.27.6"
+# shown in development (or the next versions that will be supported)
+dev_supported_k8s = ["1.26", "1.27", "1.28"]
+dev_k8s_api_version = "1.27"
+dev_gke_example_cluster_version = "1.27"
+dev_aks_example_cluster_version = "1.28.0"
+dev_eks_example_cluster_version = "1.28"
+dev_minikube_example_cluster_version = "1.27.6"
 
 # example tag
-example_image_tag = "gcr.io/agones-images/simple-game-server:0.14"
+example_image_tag = "us-docker.pkg.dev/agones-images/examples/simple-game-server:0.22"
 
 # Enable syntax highlighting and copy buttons on code blocks with Prism
 prism_syntax_highlighting = true
@@ -162,4 +166,11 @@ no = 'Sorry to hear that. Please <a href="https://github.com/googleforgames/agon
 # 	icon = "fa fa-envelope"
 #         desc = "Discuss development issues around the project"
 
-
+[security.funcs]
+  getenv = ['^HUGO_', '^CI$', 'RELEASE_BRANCH', 'HUGO_ENV', 'RELEASE_VERSION']
+[module]
+proxy = "direct"
+[[module.imports]]
+path = "github.com/google/docsy"
+[[module.imports]]
+path = "github.com/google/docsy/dependencies"

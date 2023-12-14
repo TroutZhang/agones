@@ -93,9 +93,8 @@ func main() {
 			Container: "simple-game-server",
 			Ports: []agonesv1.GameServerPort{{
 				ContainerPort: 7654,
-				HostPort:      7654,
 				Name:          "gameport",
-				PortPolicy:    agonesv1.Static,
+				PortPolicy:    agonesv1.Dynamic,
 				Protocol:      corev1.ProtocolUDP,
 			}},
 			Template: corev1.PodTemplateSpec{
@@ -113,7 +112,7 @@ func main() {
 	ctx := context.Background()
 	newGS, err := agonesClient.AgonesV1().GameServers(gs.Namespace).Create(ctx, gs, metav1.CreateOptions{})
 	if err != nil {
-		logrus.Fatal("Unable to create GameServer: %v", err)
+		logrus.Fatalf("Unable to create GameServer: %v", err)
 	}
 	logrus.Infof("New GameServer name is: %s", newGS.ObjectMeta.Name)
 

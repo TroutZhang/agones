@@ -20,14 +20,15 @@
 #   \__, |_| \_\_|    \____|   |_|\___/ \___/|_|_|_| |_|\__, |
 #   |___/                                               |___/
 
-build_sdk_base_version = $(call sha,$(build_path)/build-sdk-images/tool/base/Dockerfile)
+grpc_release_tag = v1.57.0
+
+build_sdk_base_version = $(call sha,$(build_path)/build-sdk-images/tool/base/Dockerfile)_$(grpc_release_tag)
 build_sdk_base_tag = agones-build-sdk-base:$(build_sdk_base_version)
 
 # Calculate sha hash of sha hashes of all files in a specified SDK_FOLDER
 build_sdk_version = $(call sha_dir,$(build_path)/build-sdk-images/$(SDK_FOLDER)/*)
 build_sdk_base_remote_tag = $(REGISTRY)/$(build_sdk_base_tag)
 build_sdk_prefix = agones-build-sdk-
-grpc_release_tag = v1.36.1
 sdk_build_folder = build-sdk-images/
 examples_folder = ../examples/
 SDK_FOLDER ?= go
@@ -35,6 +36,8 @@ COMMAND ?= gen
 SDK_IMAGE_TAG=$(build_sdk_prefix)$(SDK_FOLDER):$(build_sdk_version)
 DEFAULT_CONFORMANCE_TESTS = ready,allocate,setlabel,setannotation,gameserver,health,shutdown,watch,reserve
 ALPHA_CONFORMANCE_TESTS = getplayercapacity,setplayercapacity,playerconnect,playerdisconnect,getplayercount,isplayerconnected,getconnectedplayers
+# TODO: Move Counter and List tests into ALPHA_CONFORMANCE_TESTS once the they are written for all SDKs
+COUNTS_AND_LISTS_TESTS = getcounter,updatecounter,setcountcounter,setcapacitycounter,getlist,updatelist,addlistvalue,removelistvalue
 
 .PHONY: test-sdks test-sdk build-sdks build-sdk gen-all-sdk-grpc gen-sdk-grpc run-all-sdk-command run-sdk-command build-example
 
@@ -142,15 +145,21 @@ run-sdk-conformance-no-build: HTTP_PORT ?= 9358
 run-sdk-conformance-no-build: FEATURE_GATES ?=
 run-sdk-conformance-no-build: ensure-agones-sdk-image
 run-sdk-conformance-no-build: ensure-build-sdk-image
-	DOCKER_RUN_ARGS="--net host -e AGONES_SDK_GRPC_PORT=$(GRPC_PORT) -e AGONES_SDK_HTTP_PORT=$(HTTP_PORT) -e FEATURE_GATES=$(FEATURE_GATES) $(DOCKER_RUN_ARGS)" COMMAND=sdktest $(MAKE) run-sdk-command & \
+	DOCKER_RUN_ARGS="--net host -e AGONES_SDK_GRPC_PORT=$(GRPC_PORT) -e AGONES_SDK_HTTP_PORT=$(HTTP_PORT) -e FEATURE_GATES='$(FEATURE_GATES)' $(DOCKER_RUN_ARGS)" COMMAND=sdktest $(MAKE) run-sdk-command & \
 	docker run -p $(GRPC_PORT):$(GRPC_PORT) -p $(HTTP_PORT):$(HTTP_PORT) -e "FEATURE_GATES=$(FEATURE_GATES)" -e "ADDRESS=" -e "TEST=$(TESTS)" -e "SDK_NAME=$(SDK_FOLDER)" -e "TIMEOUT=$(TIMEOUT)" -e "DELAY=$(DELAY)" \
 	--net=host $(sidecar_linux_amd64_tag) --grpc-port $(GRPC_PORT) --http-port $(HTTP_PORT)
 
 # Run SDK conformance test for a specific SDK_FOLDER
+run-sdk-conformance-test: TRIES=5
 run-sdk-conformance-test: ensure-agones-sdk-image
 run-sdk-conformance-test: ensure-build-sdk-image
+	@echo "\n\n^^^ Building: $(SDK_FOLDER)\n\n"
 	$(MAKE) run-sdk-command COMMAND=build-sdk-test
-	$(MAKE) run-sdk-conformance-no-build
+	@for try in `seq 1 $(TRIES)`; do \
+	  echo "\n\n>>> Starting: ($$try/$(TRIES)) $(SDK_FOLDER)\n\n" && \
+	  $(MAKE) run-sdk-conformance-no-build && echo "\n\n+++ Success: ($$try/$(TRIES)) $(SDK_FOLDER)\n\n" && break || \
+	    echo "\n\n*** Failure: ($$try/$(TRIES)) $(SDK_FOLDER)\n\n" && false; \
+	done
 
 run-sdk-conformance-test-cpp:
 	$(MAKE) run-sdk-conformance-test SDK_FOLDER=cpp GRPC_PORT=9003 HTTP_PORT=9103
@@ -162,7 +171,7 @@ run-sdk-conformance-test-go:
 	# run without feature flags
 	$(MAKE) run-sdk-conformance-test SDK_FOLDER=go GRPC_PORT=9001 HTTP_PORT=9101
 	# run with feature flags enabled
-	$(MAKE) run-sdk-conformance-no-build SDK_FOLDER=go GRPC_PORT=9001 HTTP_PORT=9101 FEATURE_GATES=PlayerTracking=true TESTS=$(DEFAULT_CONFORMANCE_TESTS),$(ALPHA_CONFORMANCE_TESTS)
+	$(MAKE) run-sdk-conformance-test SDK_FOLDER=go GRPC_PORT=9001 HTTP_PORT=9101 FEATURE_GATES=$(ALPHA_FEATURE_GATES) TESTS=$(DEFAULT_CONFORMANCE_TESTS),$(ALPHA_CONFORMANCE_TESTS),$(COUNTS_AND_LISTS_TESTS)
 
 run-sdk-conformance-test-rust:
 	# run without feature flags
@@ -174,16 +183,23 @@ run-sdk-conformance-test-rust:
 	# run with feature flags enabled and with RUN_ASYNC=true
 	DOCKER_RUN_ARGS="$(DOCKER_RUN_ARGS) -e RUN_ASYNC=true" $(MAKE) run-sdk-conformance-test SDK_FOLDER=rust GRPC_PORT=9004 HTTP_PORT=9104 FEATURE_GATES=PlayerTracking=true TESTS=$(DEFAULT_CONFORMANCE_TESTS),$(ALPHA_CONFORMANCE_TESTS)
 
-run-sdk-conformance-test-rest:
+run-sdk-conformance-test-csharp:
 	# run without feature flags
-	$(MAKE) run-sdk-conformance-test SDK_FOLDER=restapi HTTP_PORT=9050
+	$(MAKE) run-sdk-conformance-test SDK_FOLDER=csharp GRPC_PORT=9005 HTTP_PORT=9105
 	# run with feature flags enabled
-	$(MAKE) run-sdk-conformance-no-build SDK_FOLDER=restapi GRPC_PORT=9001 HTTP_PORT=9101 FEATURE_GATES=PlayerTracking=true TESTS=$(DEFAULT_CONFORMANCE_TESTS),$(ALPHA_CONFORMANCE_TESTS)
+	$(MAKE) run-sdk-conformance-test SDK_FOLDER=csharp GRPC_PORT=9005 HTTP_PORT=9105 FEATURE_GATES=PlayerTracking=true TESTS=$(DEFAULT_CONFORMANCE_TESTS),$(ALPHA_CONFORMANCE_TESTS)
+
+run-sdk-conformance-test-rest:
+	# (note: the restapi folder doesn't use GRPC_PORT but run-sdk-conformance-no-build defaults it, so we supply a unique value here)
+	# run without feature flags
+	$(MAKE) run-sdk-conformance-test SDK_FOLDER=restapi GRPC_PORT=9050 HTTP_PORT=9150
+	# run with feature flags enabled
+	$(MAKE) run-sdk-conformance-test SDK_FOLDER=restapi GRPC_PORT=9050 HTTP_PORT=9150 FEATURE_GATES=PlayerTracking=true TESTS=$(DEFAULT_CONFORMANCE_TESTS),$(ALPHA_CONFORMANCE_TESTS)
 
 	$(MAKE) run-sdk-command COMMAND=clean SDK_FOLDER=restapi
 
 # Run a conformance test for all SDKs supported
-run-sdk-conformance-tests: run-sdk-conformance-test-node run-sdk-conformance-test-go run-sdk-conformance-test-rust run-sdk-conformance-test-rest run-sdk-conformance-test-cpp
+run-sdk-conformance-tests: run-sdk-conformance-test-node run-sdk-conformance-test-go run-sdk-conformance-test-rust run-sdk-conformance-test-rest run-sdk-conformance-test-cpp run-sdk-conformance-test-csharp
 
 # Clean package directories and binary files left
 # after building conformance tests for all SDKs supported
@@ -210,29 +226,28 @@ sdk-publish-csharp: RELEASE_VERSION ?= $(base_version)
 sdk-publish-csharp:
 	$(MAKE) run-sdk-command-csharp COMMAND=publish VERSION=$(RELEASE_VERSION) DOCKER_RUN_ARGS="$(DOCKER_RUN_ARGS) -it"
 
-# Perform make build for all examples
-build-examples: build-example-xonotic build-example-cpp-simple build-example-autoscaler-webhook build-example-nodejs-simple
+# SDK shell for rust
+sdk-shell-rust:
+	$(MAKE) sdk-shell SDK_FOLDER=rust
 
-# Run "make build" command for one example directory
-build-example:
-	cd  $(examples_folder)/$(EXAMPLE); \
-	if [ -f Makefile ] ; then \
-		make build; \
+# Publish the Rust SDK to crates.io
+sdk-publish-rust:
+	$(MAKE) run-sdk-command-rust VERSION=$(RELEASE_VERSION) DOCKER_RUN_ARGS="$(DOCKER_RUN_ARGS) -it" COMMAND=publish
+
+# difference in sdks before and after gen-all-sdk-grpc target
+test-gen-all-sdk-grpc:
+	make gen-all-sdk-grpc
+	@echo; \
+	echo "=== Diffing workspace after 'make gen-all-sdk-grpc'"; \
+	diff_output=$$(git diff HEAD -- ../sdks); \
+	diff_output_test_sdk=$$(git diff HEAD -- ../test/sdk); \
+	if [ -z "$$diff_output" ] && [ -z "$$diff_output_test_sdk" ]; then \
+		echo "+++ Success: No differences found."; \
 	else \
-		echo "Makefile was not found in "/examples/$(EXAMPLE)" directory - nothing to execute" ; \
+		echo "*** Failure: Differences found:"; \
+		echo "Changes in ../sdks:"; \
+		echo "$$diff_output"; \
+		echo "Changes in ../test/sdk:"; \
+		echo "$$diff_output_test_sdk"; \
+		exit 1; \
 	fi
-
-build-example-xonotic:
-	$(MAKE) build-example EXAMPLE=xonotic
-
-build-example-cpp-simple:
-	$(MAKE) build-example EXAMPLE=cpp-simple
-
-build-example-rust-simple:
-	$(MAKE) build-example EXAMPLE=rust-simple
-
-build-example-autoscaler-webhook:
-	$(MAKE) build-example EXAMPLE=autoscaler-webhook
-
-build-example-nodejs-simple:
-	$(MAKE) build-example EXAMPLE=nodejs-simple

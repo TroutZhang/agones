@@ -15,19 +15,25 @@
 package v1
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
 	"agones.dev/agones/pkg/apis"
+	"agones.dev/agones/pkg/util/runtime"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/validation"
+	"k8s.io/apimachinery/pkg/util/validation/field"
 )
 
 func TestFleetGameServerSetGameServer(t *testing.T) {
+	t.Parallel()
+
 	f := Fleet{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "test",
@@ -59,6 +65,32 @@ func TestFleetGameServerSetGameServer(t *testing.T) {
 	assert.Equal(t, f.Spec.Scheduling, gsSet.Spec.Scheduling)
 	assert.Equal(t, f.Spec.Template, gsSet.Spec.Template)
 	assert.True(t, metav1.IsControlledBy(gsSet, &f))
+
+	runtime.FeatureTestMutex.Lock()
+	defer runtime.FeatureTestMutex.Unlock()
+
+	runtime.Must(runtime.ParseFeatures(fmt.Sprintf("%s=true&%s=true", runtime.FeatureFleetAllocateOverflow, runtime.FeatureCountsAndLists)))
+	gsSet = f.GameServerSet()
+	assert.Nil(t, gsSet.Spec.AllocationOverflow)
+
+	f.Spec.AllocationOverflow = &AllocationOverflow{
+		Labels:      map[string]string{"stuff": "things"},
+		Annotations: nil,
+	}
+
+	assert.Nil(t, f.Spec.Priorities)
+	f.Spec.Priorities = []Priority{
+		{Type: "Counter",
+			Key:   "Foo",
+			Order: "Ascending"}}
+	assert.NotNil(t, f.Spec.Priorities)
+	assert.Equal(t, f.Spec.Priorities[0], Priority{Type: "Counter", Key: "Foo", Order: "Ascending"})
+
+	gsSet = f.GameServerSet()
+	assert.NotNil(t, gsSet.Spec.AllocationOverflow)
+	assert.Equal(t, "things", gsSet.Spec.AllocationOverflow.Labels["stuff"])
+
+	assert.Equal(t, gsSet.Spec.Priorities[0], Priority{Type: "Counter", Key: "Foo", Order: "Ascending"})
 }
 
 func TestFleetApplyDefaults(t *testing.T) {
@@ -107,9 +139,8 @@ func TestSumStatusAllocatedReplicas(t *testing.T) {
 func TestFleetGameserverSpec(t *testing.T) {
 	f := defaultFleet()
 	f.ApplyDefaults()
-	causes, ok := f.Validate()
-	assert.True(t, ok)
-	assert.Len(t, causes, 0)
+	errs := f.Validate(fakeAPIHooks{})
+	assert.Len(t, errs, 0)
 
 	f.Spec.Template.Spec.Template =
 		corev1.PodTemplateSpec{
@@ -117,79 +148,96 @@ func TestFleetGameserverSpec(t *testing.T) {
 				Containers: []corev1.Container{{Name: "container", Image: "myimage"}, {Name: "container2", Image: "myimage"}},
 			},
 		}
-	causes, ok = f.Validate()
 
-	assert.False(t, ok)
-	assert.Len(t, causes, 1)
-	assert.Equal(t, "container", causes[0].Field)
+	errs = f.Validate(fakeAPIHooks{})
+	assert.Len(t, errs, 1)
+	assert.Equal(t, "spec.template.spec.container", errs[0].Field)
 
 	f.Spec.Template.Spec.Container = "testing"
-	causes, ok = f.Validate()
-
-	assert.False(t, ok)
-	assert.Len(t, causes, 1)
-	assert.Equal(t, "Could not find a container named testing", causes[0].Message)
+	errs = f.Validate(fakeAPIHooks{})
+	assert.Len(t, errs, 1)
+	assert.Equal(t, "Could not find a container named testing", errs[0].Detail)
 
 	f.Spec.Template.Spec.Container = "container"
-	causes, ok = f.Validate()
-	assert.True(t, ok)
-	assert.Len(t, causes, 0)
+	errs = f.Validate(fakeAPIHooks{})
+	assert.Len(t, errs, 0)
 
 	// Verify RollingUpdate parameters validation
 	percent := intstr.FromString("0%")
 	f.Spec.Strategy.RollingUpdate.MaxUnavailable = &percent
 	f.Spec.Strategy.RollingUpdate.MaxSurge = &percent
-	causes, ok = f.Validate()
-	assert.False(t, ok)
-	assert.Len(t, causes, 2)
+	errs = f.Validate(fakeAPIHooks{})
+	assert.Len(t, errs, 2)
 
 	intParam := intstr.FromInt(0)
 	f.Spec.Strategy.RollingUpdate.MaxUnavailable = &intParam
 	f.Spec.Strategy.RollingUpdate.MaxSurge = &intParam
-	causes, ok = f.Validate()
-	assert.False(t, ok)
-	assert.Len(t, causes, 2)
+	errs = f.Validate(fakeAPIHooks{})
+	assert.Len(t, errs, 2)
 
 	percent = intstr.FromString("2a")
 	f.Spec.Strategy.RollingUpdate.MaxUnavailable = &percent
 	f.Spec.Strategy.RollingUpdate.MaxSurge = &percent
-	causes, ok = f.Validate()
-	assert.False(t, ok)
-	assert.Len(t, causes, 2)
+	errs = f.Validate(fakeAPIHooks{})
+	assert.Len(t, errs, 2)
 
 	longName := strings.Repeat("f", validation.LabelValueMaxLength+1)
 	f = defaultFleet()
 	f.ApplyDefaults()
 	f.Spec.Template.ObjectMeta.Labels = make(map[string]string)
 	f.Spec.Template.ObjectMeta.Labels["label"] = longName
-	causes, ok = f.Validate()
-	assert.False(t, ok)
-	assert.Len(t, causes, 1)
+	errs = f.Validate(fakeAPIHooks{})
+	assert.Len(t, errs, 1)
 
 	f = defaultFleet()
 	f.ApplyDefaults()
 	f.Spec.Template.Spec.Template.ObjectMeta.Labels = make(map[string]string)
 	f.Spec.Template.Spec.Template.ObjectMeta.Labels["label"] = longName
-	causes, ok = f.Validate()
-	assert.False(t, ok)
-	assert.Len(t, causes, 1)
+	errs = f.Validate(fakeAPIHooks{})
+	assert.Len(t, errs, 1)
 
 	// Annotations test
 	f = defaultFleet()
 	f.ApplyDefaults()
 	f.Spec.Template.Spec.Template.ObjectMeta.Annotations = make(map[string]string)
 	f.Spec.Template.Spec.Template.ObjectMeta.Annotations[longName] = ""
-	causes, ok = f.Validate()
-	assert.False(t, ok)
-	assert.Len(t, causes, 1)
+	errs = f.Validate(fakeAPIHooks{})
+	assert.Len(t, errs, 1)
 
 	// Strategy Type validation test
 	f = defaultFleet()
 	f.ApplyDefaults()
 	f.Spec.Strategy.Type = appsv1.DeploymentStrategyType("")
-	causes, ok = f.Validate()
-	assert.False(t, ok)
-	assert.Len(t, causes, 1)
+	errs = f.Validate(fakeAPIHooks{})
+	assert.Len(t, errs, 1)
+}
+
+func TestFleetAllocationOverflow(t *testing.T) {
+	t.Parallel()
+	runtime.FeatureTestMutex.Lock()
+	defer runtime.FeatureTestMutex.Unlock()
+
+	runtime.Must(runtime.ParseFeatures(fmt.Sprintf("%s=true", runtime.FeatureFleetAllocateOverflow)))
+
+	f := defaultFleet()
+	f.ApplyDefaults()
+
+	errs := f.Validate(fakeAPIHooks{})
+	require.Empty(t, errs)
+
+	f.Spec.AllocationOverflow = &AllocationOverflow{
+		Labels:      map[string]string{"$$$nope": "value"},
+		Annotations: nil,
+	}
+
+	errs = f.Validate(fakeAPIHooks{})
+	require.Len(t, errs, 1)
+	require.Equal(t, field.ErrorTypeInvalid, errs[0].Type)
+
+	runtime.Must(runtime.ParseFeatures(fmt.Sprintf("%s=false", runtime.FeatureFleetAllocateOverflow)))
+	errs = f.Validate(fakeAPIHooks{})
+	require.Len(t, errs, 1)
+	require.Equal(t, field.ErrorTypeForbidden, errs[0].Type)
 }
 
 func TestFleetName(t *testing.T) {
@@ -198,16 +246,14 @@ func TestFleetName(t *testing.T) {
 
 	longName := strings.Repeat("f", validation.LabelValueMaxLength+1)
 	f.Name = longName
-	causes, ok := f.Validate()
-	assert.False(t, ok)
-	assert.Len(t, causes, 1)
-	assert.Equal(t, "Name", causes[0].Field)
+	errs := f.Validate(fakeAPIHooks{})
+	assert.Len(t, errs, 1)
+	assert.Equal(t, "metadata.name", errs[0].Field)
 
 	f.Name = ""
 	f.GenerateName = longName
-	causes, ok = f.Validate()
-	assert.True(t, ok)
-	assert.Len(t, causes, 0)
+	errs = f.Validate(fakeAPIHooks{})
+	assert.Len(t, errs, 0)
 }
 
 func TestSumStatusReplicas(t *testing.T) {
@@ -240,6 +286,23 @@ func TestGetReadyReplicaCountForGameServerSets(t *testing.T) {
 	}
 
 	assert.Equal(t, int32(1020), GetReadyReplicaCountForGameServerSets(fixture))
+}
+
+func TestSumGameServerSets(t *testing.T) {
+	fixture := []*GameServerSet{
+		{Status: GameServerSetStatus{ReadyReplicas: 1000}},
+		{Status: GameServerSetStatus{ReadyReplicas: 15}},
+		{Status: GameServerSetStatus{ReadyReplicas: 5}},
+		nil,
+	}
+
+	assert.Equal(t, int32(1020), SumGameServerSets(fixture, func(gsSet *GameServerSet) int32 {
+		return gsSet.Status.ReadyReplicas
+	}))
+
+	assert.Equal(t, int32(0), SumGameServerSets(fixture, func(gsSet *GameServerSet) int32 {
+		return gsSet.Status.Replicas
+	}))
 }
 
 func defaultFleet() *Fleet {

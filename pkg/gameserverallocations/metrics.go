@@ -91,9 +91,7 @@ func (r *metrics) setRequest(in *allocationv1.GameServerAllocation) {
 	tags := []tag.Mutator{
 		tag.Update(keySchedulingStrategy, string(in.Spec.Scheduling)),
 	}
-	if in.ClusterName != "" {
-		tags = append(tags, tag.Update(keyClusterName, in.ClusterName))
-	}
+
 	tags = append(tags, tag.Update(keyMultiCluster, strconv.FormatBool(in.Spec.MultiClusterSetting.Enabled)))
 	r.mutate(tags...)
 }
@@ -107,7 +105,7 @@ func (r *metrics) setResponse(o k8sruntime.Object) {
 	r.setStatus(string(out.Status.State))
 	var tags []tag.Mutator
 	// sets the fleet name tag if possible
-	if out.Status.State == allocationv1.GameServerAllocationAllocated {
+	if out.Status.State == allocationv1.GameServerAllocationAllocated && out.Status.Source == localAllocationSource {
 		gs, err := r.gameServerLister.GameServers(out.Namespace).Get(out.Status.GameServerName)
 		if err != nil {
 			r.logger.WithError(err).Warnf("failed to get gameserver:%s namespace:%s", out.Status.GameServerName, out.Namespace)

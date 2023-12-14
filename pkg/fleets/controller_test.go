@@ -25,8 +25,10 @@ import (
 	"agones.dev/agones/pkg/apis"
 	agonesv1 "agones.dev/agones/pkg/apis/agones/v1"
 	v1 "agones.dev/agones/pkg/apis/agones/v1"
+	applyconfigurations "agones.dev/agones/pkg/client/applyconfiguration/agones/v1"
 	agonesv1clientset "agones.dev/agones/pkg/client/clientset/versioned/typed/agones/v1"
 	agonesv1client "agones.dev/agones/pkg/client/listers/agones/v1"
+	"agones.dev/agones/pkg/cloudproduct/generic"
 	agtesting "agones.dev/agones/pkg/testing"
 	utilruntime "agones.dev/agones/pkg/util/runtime"
 	"agones.dev/agones/pkg/util/webhooks"
@@ -338,7 +340,9 @@ func TestControllerSyncFleet(t *testing.T) {
 
 		gsSet := f.GameServerSet()
 		// make gsSet.Spec.Template and f.Spec.Template different in order to make 'rest' list not empty
-		gsSet.Spec.Template.ClusterName = "qqqqqqqqqqqqqqqqqqq"
+		gsSet.Spec.Template.Name = "qqqqqqqqqqqqqqqqqqq"
+		// make sure there is at least one replica, or the logic will escape before the check.
+		gsSet.Spec.Replicas = 1
 
 		m.AgonesClient.AddReactor("list", "fleets", func(action k8stesting.Action) (bool, runtime.Object, error) {
 			return true, &agonesv1.FleetList{Items: []agonesv1.Fleet{*f}}, nil
@@ -361,7 +365,7 @@ func TestControllerSyncFleet(t *testing.T) {
 
 		gsSet := f.GameServerSet()
 		// make gsSet.Spec.Template and f.Spec.Template different in order to make 'rest' list not empty
-		gsSet.Spec.Template.ClusterName = "qqqqqqqqqqqqqqqqqqq"
+		gsSet.Spec.Template.Name = "qqqqqqqqqqqqqqqqqqq"
 
 		m.AgonesClient.AddReactor("list", "fleets", func(action k8stesting.Action) (bool, runtime.Object, error) {
 			return true, &agonesv1.FleetList{Items: []agonesv1.Fleet{*f}}, nil
@@ -411,33 +415,31 @@ func TestControllerSyncFleet(t *testing.T) {
 func TestControllerCreationValidationHandler(t *testing.T) {
 	t.Parallel()
 
+	ext := newFakeExtensions()
+
 	t.Run("invalid JSON", func(t *testing.T) {
-		c, _ := newFakeController()
 		raw, err := json.Marshal([]byte(`1`))
 		require.NoError(t, err)
 		review := getAdmissionReview(raw)
 
-		_, err = c.creationValidationHandler(review)
-		assert.EqualError(t, err, "error unmarshalling original Fleet json: \"MQ==\": json: cannot unmarshal string into Go value of type v1.Fleet")
+		_, err = ext.creationValidationHandler(review)
+		assert.EqualError(t, err, "error unmarshalling Fleet json after schema validation: \"MQ==\": json: cannot unmarshal string into Go value of type v1.Fleet")
 	})
 
 	t.Run("invalid fleet", func(t *testing.T) {
-		c, _ := newFakeController()
 		fixture := agonesv1.Fleet{}
 
 		raw, err := json.Marshal(fixture)
 		require.NoError(t, err)
 		review := getAdmissionReview(raw)
 
-		result, err := c.creationValidationHandler(review)
+		result, err := ext.creationValidationHandler(review)
 		require.NoError(t, err)
 		assert.False(t, result.Response.Allowed)
 		assert.Equal(t, "Failure", result.Response.Result.Status)
 	})
 
 	t.Run("valid fleet", func(t *testing.T) {
-		c, _ := newFakeController()
-
 		gsSpec := *defaultGSSpec()
 		f := defaultFixture()
 		f.Spec.Template = gsSpec
@@ -446,7 +448,7 @@ func TestControllerCreationValidationHandler(t *testing.T) {
 		require.NoError(t, err)
 		review := getAdmissionReview(raw)
 
-		result, err := c.creationValidationHandler(review)
+		result, err := ext.creationValidationHandler(review)
 		require.NoError(t, err)
 		assert.True(t, result.Response.Allowed)
 	})
@@ -456,14 +458,14 @@ func TestControllerCreationMutationHandler(t *testing.T) {
 	t.Parallel()
 
 	t.Run("ok scenario", func(t *testing.T) {
-		c, _ := newFakeController()
+		ext := newFakeExtensions()
 		fixture := agonesv1.Fleet{}
 
 		raw, err := json.Marshal(fixture)
 		require.NoError(t, err)
 		review := getAdmissionReview(raw)
 
-		result, err := c.creationMutationHandler(review)
+		result, err := ext.creationMutationHandler(review)
 		require.NoError(t, err)
 		assert.True(t, result.Response.Allowed)
 		assert.Equal(t, admissionv1.PatchTypeJSONPatch, *result.Response.PatchType)
@@ -487,13 +489,14 @@ func TestControllerCreationMutationHandler(t *testing.T) {
 	})
 
 	t.Run("invalid JSON", func(t *testing.T) {
-		c, _ := newFakeController()
+		ext := newFakeExtensions()
 		raw, err := json.Marshal([]byte(`1`))
 		require.NoError(t, err)
 		review := getAdmissionReview(raw)
 
-		_, err = c.creationMutationHandler(review)
-		assert.EqualError(t, err, "error unmarshalling original Fleet json: \"MQ==\": json: cannot unmarshal string into Go value of type v1.Fleet")
+		result, err := ext.creationMutationHandler(review)
+		assert.NoError(t, err)
+		require.Nil(t, result.Response.PatchType)
 	})
 }
 
@@ -685,6 +688,186 @@ func TestControllerUpdateFleetPlayerStatus(t *testing.T) {
 	assert.True(t, updated)
 }
 
+// nolint:dupl // Linter errors on lines are duplicate of TestControllerUpdateFleetListStatus
+func TestControllerUpdateFleetCounterStatus(t *testing.T) {
+	t.Parallel()
+
+	utilruntime.FeatureTestMutex.Lock()
+	defer utilruntime.FeatureTestMutex.Unlock()
+
+	require.NoError(t, utilruntime.ParseFeatures(string(utilruntime.FeatureCountsAndLists)+"=true"))
+
+	fleet := defaultFixture()
+	c, m := newFakeController()
+
+	gsSet1 := fleet.GameServerSet()
+	gsSet1.ObjectMeta.Name = "gsSet1"
+	gsSet1.Status.Counters = map[string]agonesv1.AggregatedCounterStatus{
+		"fullCounter": {
+			AllocatedCount:    1000,
+			AllocatedCapacity: 1000,
+			Capacity:          1000,
+			Count:             1000,
+		},
+		"anotherCounter": {
+			AllocatedCount:    11,
+			AllocatedCapacity: 20,
+			Capacity:          100,
+			Count:             42,
+		},
+	}
+
+	gsSet2 := fleet.GameServerSet()
+	gsSet2.ObjectMeta.Name = "gsSet2"
+	gsSet2.Status.Counters = map[string]agonesv1.AggregatedCounterStatus{
+		"fullCounter": {
+			AllocatedCount:    100,
+			AllocatedCapacity: 100,
+			Capacity:          100,
+			Count:             100,
+		},
+		"anotherCounter": {
+			AllocatedCount:    0,
+			AllocatedCapacity: 0,
+			Capacity:          100,
+			Count:             0,
+		},
+		"thirdCounter": {
+			AllocatedCount:    21,
+			AllocatedCapacity: 30,
+			Capacity:          400,
+			Count:             21,
+		},
+	}
+
+	m.AgonesClient.AddReactor("list", "gameserversets",
+		func(action k8stesting.Action) (bool, runtime.Object, error) {
+			return true, &agonesv1.GameServerSetList{Items: []agonesv1.GameServerSet{*gsSet1, *gsSet2}}, nil
+		})
+
+	updated := false
+	m.AgonesClient.AddReactor("update", "fleets",
+		func(action k8stesting.Action) (bool, runtime.Object, error) {
+			updated = true
+			ua := action.(k8stesting.UpdateAction)
+			fleet := ua.GetObject().(*agonesv1.Fleet)
+
+			assert.Equal(t, int64(1100), fleet.Status.Counters["fullCounter"].AllocatedCount)
+			assert.Equal(t, int64(1100), fleet.Status.Counters["fullCounter"].AllocatedCapacity)
+			assert.Equal(t, int64(1100), fleet.Status.Counters["fullCounter"].Capacity)
+			assert.Equal(t, int64(1100), fleet.Status.Counters["fullCounter"].Count)
+
+			assert.Equal(t, int64(11), fleet.Status.Counters["anotherCounter"].AllocatedCount)
+			assert.Equal(t, int64(20), fleet.Status.Counters["anotherCounter"].AllocatedCapacity)
+			assert.Equal(t, int64(200), fleet.Status.Counters["anotherCounter"].Capacity)
+			assert.Equal(t, int64(42), fleet.Status.Counters["anotherCounter"].Count)
+
+			assert.Equal(t, int64(21), fleet.Status.Counters["thirdCounter"].AllocatedCount)
+			assert.Equal(t, int64(30), fleet.Status.Counters["thirdCounter"].AllocatedCapacity)
+			assert.Equal(t, int64(400), fleet.Status.Counters["thirdCounter"].Capacity)
+			assert.Equal(t, int64(21), fleet.Status.Counters["thirdCounter"].Count)
+
+			return true, fleet, nil
+		})
+
+	ctx, cancel := agtesting.StartInformers(m, c.fleetSynced, c.gameServerSetSynced)
+	defer cancel()
+
+	err := c.updateFleetStatus(ctx, fleet)
+	assert.Nil(t, err)
+	assert.True(t, updated)
+}
+
+// nolint:dupl // Linter errors on lines are duplicate of TestControllerUpdateFleetCounterStatus
+func TestControllerUpdateFleetListStatus(t *testing.T) {
+	t.Parallel()
+
+	utilruntime.FeatureTestMutex.Lock()
+	defer utilruntime.FeatureTestMutex.Unlock()
+
+	require.NoError(t, utilruntime.ParseFeatures(string(utilruntime.FeatureCountsAndLists)+"=true"))
+
+	fleet := defaultFixture()
+	c, m := newFakeController()
+
+	gsSet1 := fleet.GameServerSet()
+	gsSet1.ObjectMeta.Name = "gsSet1"
+	gsSet1.Status.Lists = map[string]agonesv1.AggregatedListStatus{
+		"fullList": {
+			AllocatedCount:    1000,
+			AllocatedCapacity: 1000,
+			Capacity:          1000,
+			Count:             1000,
+		},
+		"anotherList": {
+			AllocatedCount:    11,
+			AllocatedCapacity: 100,
+			Capacity:          100,
+			Count:             11,
+		},
+		"thirdList": {
+			AllocatedCount:    1,
+			AllocatedCapacity: 20,
+			Capacity:          30,
+			Count:             4,
+		},
+	}
+
+	gsSet2 := fleet.GameServerSet()
+	gsSet2.ObjectMeta.Name = "gsSet2"
+	gsSet2.Status.Lists = map[string]agonesv1.AggregatedListStatus{
+		"fullList": {
+			AllocatedCount:    200,
+			AllocatedCapacity: 200,
+			Capacity:          200,
+			Count:             200,
+		},
+		"anotherList": {
+			AllocatedCount:    1,
+			AllocatedCapacity: 10,
+			Capacity:          100,
+			Count:             11,
+		},
+	}
+
+	m.AgonesClient.AddReactor("list", "gameserversets",
+		func(action k8stesting.Action) (bool, runtime.Object, error) {
+			return true, &agonesv1.GameServerSetList{Items: []agonesv1.GameServerSet{*gsSet1, *gsSet2}}, nil
+		})
+
+	updated := false
+	m.AgonesClient.AddReactor("update", "fleets",
+		func(action k8stesting.Action) (bool, runtime.Object, error) {
+			updated = true
+			ua := action.(k8stesting.UpdateAction)
+			fleet := ua.GetObject().(*agonesv1.Fleet)
+
+			assert.Equal(t, int64(1200), fleet.Status.Lists["fullList"].AllocatedCount)
+			assert.Equal(t, int64(1200), fleet.Status.Lists["fullList"].AllocatedCapacity)
+			assert.Equal(t, int64(1200), fleet.Status.Lists["fullList"].Capacity)
+			assert.Equal(t, int64(1200), fleet.Status.Lists["fullList"].Count)
+
+			assert.Equal(t, int64(12), fleet.Status.Lists["anotherList"].AllocatedCount)
+			assert.Equal(t, int64(110), fleet.Status.Lists["anotherList"].AllocatedCapacity)
+			assert.Equal(t, int64(200), fleet.Status.Lists["anotherList"].Capacity)
+			assert.Equal(t, int64(22), fleet.Status.Lists["anotherList"].Count)
+
+			assert.Equal(t, int64(1), fleet.Status.Lists["thirdList"].AllocatedCount)
+			assert.Equal(t, int64(20), fleet.Status.Lists["thirdList"].AllocatedCapacity)
+			assert.Equal(t, int64(30), fleet.Status.Lists["thirdList"].Capacity)
+			assert.Equal(t, int64(4), fleet.Status.Lists["thirdList"].Count)
+
+			return true, fleet, nil
+		})
+
+	ctx, cancel := agtesting.StartInformers(m, c.fleetSynced, c.gameServerSetSynced)
+	defer cancel()
+
+	err := c.updateFleetStatus(ctx, fleet)
+	assert.Nil(t, err)
+	assert.True(t, updated)
+}
+
 func TestControllerFilterGameServerSetByActive(t *testing.T) {
 	t.Parallel()
 
@@ -781,11 +964,11 @@ func TestControllerApplyDeploymentStrategy(t *testing.T) {
 			},
 		},
 		string(appsv1.RollingUpdateDeploymentStrategyType): {
-			strategyType:         appsv1.RecreateDeploymentStrategyType,
+			strategyType:         appsv1.RollingUpdateDeploymentStrategyType,
 			gsSet1StatusReplicas: 10,
 			gsSet2StatusReplicas: 1,
 			expected: expected{
-				inactiveReplicas: 7,
+				inactiveReplicas: 8,
 				replicas:         2,
 			},
 		},
@@ -815,7 +998,7 @@ func TestControllerApplyDeploymentStrategy(t *testing.T) {
 				ua := action.(k8stesting.UpdateAction)
 				gsSet := ua.GetObject().(*agonesv1.GameServerSet)
 				assert.Equal(t, gsSet1.ObjectMeta.Name, gsSet.ObjectMeta.Name)
-				assert.Equal(t, int32(0), gsSet.Spec.Replicas)
+				assert.Equal(t, v.expected.inactiveReplicas, gsSet.Spec.Replicas)
 
 				return true, gsSet, nil
 			})
@@ -823,7 +1006,7 @@ func TestControllerApplyDeploymentStrategy(t *testing.T) {
 			replicas, err := c.applyDeploymentStrategy(context.Background(), f, f.GameServerSet(), []*agonesv1.GameServerSet{gsSet1, gsSet2})
 			require.NoError(t, err)
 			assert.True(t, updated, "update should happen")
-			assert.Equal(t, f.Spec.Replicas, replicas)
+			assert.Equal(t, v.expected.replicas, replicas)
 		})
 	}
 
@@ -839,6 +1022,22 @@ func TestControllerApplyDeploymentStrategy(t *testing.T) {
 		replicas, err := c.applyDeploymentStrategy(context.Background(), f, f.GameServerSet(), []*agonesv1.GameServerSet{})
 		require.NoError(t, err)
 		assert.Equal(t, f.Spec.Replicas, replicas)
+	})
+
+	t.Run("rest gameservers that are already scaled down", func(t *testing.T) {
+		f := defaultFixture()
+		f.Spec.Replicas = 10
+
+		gsSet1 := f.GameServerSet()
+		gsSet1.ObjectMeta.Name = "gsSet1"
+		gsSet1.Spec.Replicas = 0
+		gsSet1.Status.AllocatedReplicas = 1
+
+		c, _ := newFakeController()
+
+		replicas, err := c.applyDeploymentStrategy(context.Background(), f, f.GameServerSet(), []*agonesv1.GameServerSet{gsSet1})
+		require.NoError(t, err)
+		assert.Equal(t, int32(9), replicas)
 	})
 }
 
@@ -938,6 +1137,40 @@ func TestControllerUpsertGameServerSet(t *testing.T) {
 		err := c.upsertGameServerSet(context.Background(), f, gsSet, replicas)
 		assert.Nil(t, err)
 		agtesting.AssertNoEvent(t, m.FakeRecorder.Events)
+	})
+
+	t.Run("update Priorities", func(t *testing.T) {
+		utilruntime.FeatureTestMutex.Lock()
+		defer utilruntime.FeatureTestMutex.Unlock()
+		require.NoError(t, utilruntime.ParseFeatures(string(utilruntime.FeatureCountsAndLists)+"=true"))
+
+		c, m := newFakeController()
+		// Default GameServerSet has no Priorities
+		gsSet := f.GameServerSet()
+		gsSet.ObjectMeta.UID = "1234"
+		// Add Priorities to the Fleet
+		f.Spec.Priorities = []agonesv1.Priority{
+			{
+				Type:  "List",
+				Key:   "Baz",
+				Order: "Ascending",
+			}}
+		update := false
+
+		m.AgonesClient.AddReactor("update", "gameserversets", func(action k8stesting.Action) (bool, runtime.Object, error) {
+			update = true
+			ca := action.(k8stesting.UpdateAction)
+			gsSet := ca.GetObject().(*agonesv1.GameServerSet)
+			assert.Equal(t, agonesv1.Priority{Type: "List", Key: "Baz", Order: "Ascending"}, gsSet.Spec.Priorities[0])
+			return true, gsSet, nil
+		})
+
+		// Update Priorities on the GameServerSet to match the Fleet
+		err := c.upsertGameServerSet(context.Background(), f, gsSet, gsSet.Spec.Replicas)
+		assert.Nil(t, err)
+
+		assert.True(t, update, "Should be updated")
+		agtesting.AssertEventContains(t, m.FakeRecorder.Events, "UpdatingGameServerSet")
 	})
 }
 
@@ -1060,7 +1293,7 @@ func TestControllerRollingUpdateDeploymentNegativeReplica(t *testing.T) {
 		assert.Equal(t, int32(4), gsSet.Spec.Replicas)
 		assert.Equal(t, int32(5), f.Spec.Replicas)
 
-		return true, nil, errors.Errorf("error updating replicas for gameserverset for fleet %s:", f.Name)
+		return true, nil, errors.Errorf("error updating replicas for gameserverset for fleet %s", f.Name)
 	})
 
 	// assert the active gameserverset's replicas when active and inactive gameserversets exist
@@ -1401,10 +1634,14 @@ func TestControllerRollingUpdateDeployment(t *testing.T) {
 // newFakeController returns a controller, backed by the fake Clientset
 func newFakeController() (*Controller, agtesting.Mocks) {
 	m := agtesting.NewMocks()
-	wh := webhooks.NewWebHook(http.NewServeMux())
-	c := NewController(wh, healthcheck.NewHandler(), m.KubeClient, m.ExtClient, m.AgonesClient, m.AgonesInformerFactory)
+	c := NewController(healthcheck.NewHandler(), m.KubeClient, m.ExtClient, m.AgonesClient, m.AgonesInformerFactory)
 	c.recorder = m.FakeRecorder
 	return c, m
+}
+
+// newFakeExtensions returns a fake extensions struct
+func newFakeExtensions() *Extensions {
+	return NewExtensions(generic.New(), webhooks.NewWebHook(http.NewServeMux()))
 }
 
 func defaultFixture() *agonesv1.Fleet {
@@ -1526,6 +1763,14 @@ func (ffg *fakeFleetsGetterWithErr) Watch(ctx context.Context, opts metav1.ListO
 }
 
 func (ffg *fakeFleetsGetterWithErr) Patch(ctx context.Context, name string, pt types.PatchType, data []byte, opts metav1.PatchOptions, subresources ...string) (result *v1.Fleet, err error) {
+	panic("not implemented")
+}
+
+func (ffg *fakeFleetsGetterWithErr) Apply(ctx context.Context, fleet *applyconfigurations.FleetApplyConfiguration, opts metav1.ApplyOptions) (*v1.Fleet, error) {
+	panic("not implemented")
+}
+
+func (ffg *fakeFleetsGetterWithErr) ApplyStatus(ctx context.Context, fleet *applyconfigurations.FleetApplyConfiguration, opts metav1.ApplyOptions) (*v1.Fleet, error) {
 	panic("not implemented")
 }
 

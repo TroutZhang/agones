@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -38,6 +39,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	corev1 "k8s.io/api/core/v1"
+	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	k8sruntime "k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/wait"
@@ -74,21 +76,29 @@ func TestControllerAllocator(t *testing.T) {
 		m.AgonesClient.AddReactor("list", "gameservers", func(action k8stesting.Action) (bool, k8sruntime.Object, error) {
 			return true, &agonesv1.GameServerList{Items: gsList}, nil
 		})
+
+		updated := map[string]bool{}
 		m.AgonesClient.AddReactor("update", "gameservers", func(action k8stesting.Action) (bool, k8sruntime.Object, error) {
 			ua := action.(k8stesting.UpdateAction)
 			gs := ua.GetObject().(*agonesv1.GameServer)
+
+			if _, ok := updated[gs.ObjectMeta.Name]; ok {
+				return true, nil, k8serrors.NewConflict(agonesv1.Resource("gameservers"), gs.ObjectMeta.Name, fmt.Errorf("already updated"))
+			}
+
+			updated[gs.ObjectMeta.Name] = true
 			gsWatch.Modify(gs)
 			return true, gs, nil
 		})
 
-		ctx, cancel := agtesting.StartInformers(m)
+		ctx, cancel := agtesting.StartInformers(m, c.allocator.allocationPolicySynced, c.allocator.secretSynced, c.allocator.allocationCache.gameServerSynced)
 		defer cancel()
 
 		if err := c.Run(ctx, 1); err != nil {
 			assert.FailNow(t, err.Error())
 		}
 		// wait for it to be up and running
-		err := wait.PollImmediate(time.Second, 10*time.Second, func() (done bool, err error) {
+		err := wait.PollUntilContextTimeout(context.Background(), time.Second, 10*time.Second, true, func(ctx context.Context) (done bool, err error) {
 			return c.allocator.allocationCache.workerqueue.RunCount() == 1, nil
 		})
 		assert.NoError(t, err)
@@ -219,14 +229,14 @@ func TestMultiClusterAllocationFromLocal(t *testing.T) {
 			}, nil
 		})
 
-		ctx, cancel := agtesting.StartInformers(m)
+		ctx, cancel := agtesting.StartInformers(m, c.allocator.allocationPolicySynced, c.allocator.secretSynced, c.allocator.allocationCache.gameServerSynced)
 		defer cancel()
 
 		if err := c.Run(ctx, 1); err != nil {
 			assert.FailNow(t, err.Error())
 		}
 		// wait for it to be up and running
-		err := wait.PollImmediate(time.Second, 10*time.Second, func() (done bool, err error) {
+		err := wait.PollUntilContextTimeout(context.Background(), time.Second, 10*time.Second, true, func(ctx context.Context) (done bool, err error) {
 			return c.allocator.allocationCache.workerqueue.RunCount() == 1, nil
 		})
 		assert.NoError(t, err)
@@ -267,23 +277,22 @@ func TestMultiClusterAllocationFromLocal(t *testing.T) {
 			}, nil
 		})
 
-		ctx, cancel := agtesting.StartInformers(m)
+		ctx, cancel := agtesting.StartInformers(m, c.allocator.allocationPolicySynced, c.allocator.secretSynced, c.allocator.allocationCache.gameServerSynced)
 		defer cancel()
 
 		if err := c.Run(ctx, 1); err != nil {
 			assert.FailNow(t, err.Error())
 		}
 		// wait for it to be up and running
-		err := wait.PollImmediate(time.Second, 10*time.Second, func() (done bool, err error) {
+		err := wait.PollUntilContextTimeout(context.Background(), time.Second, 10*time.Second, true, func(ctx context.Context) (done bool, err error) {
 			return c.allocator.allocationCache.workerqueue.RunCount() == 1, nil
 		})
 		assert.NoError(t, err)
 
 		gsa := &allocationv1.GameServerAllocation{
 			ObjectMeta: metav1.ObjectMeta{
-				Namespace:   defaultNs,
-				Name:        "alloc1",
-				ClusterName: "multicluster",
+				Namespace: defaultNs,
+				Name:      "alloc1",
 			},
 			Spec: allocationv1.GameServerAllocationSpec{
 				MultiClusterSetting: allocationv1.MultiClusterSetting{
@@ -328,23 +337,22 @@ func TestMultiClusterAllocationFromLocal(t *testing.T) {
 			}, nil
 		})
 
-		ctx, cancel := agtesting.StartInformers(m)
+		ctx, cancel := agtesting.StartInformers(m, c.allocator.allocationPolicySynced, c.allocator.secretSynced, c.allocator.allocationCache.gameServerSynced)
 		defer cancel()
 
 		if err := c.Run(ctx, 1); err != nil {
 			assert.FailNow(t, err.Error())
 		}
 		// wait for it to be up and running
-		err := wait.PollImmediate(time.Second, 10*time.Second, func() (done bool, err error) {
+		err := wait.PollUntilContextTimeout(context.Background(), time.Second, 10*time.Second, true, func(ctx context.Context) (done bool, err error) {
 			return c.allocator.allocationCache.workerqueue.RunCount() == 1, nil
 		})
 		assert.NoError(t, err)
 
 		gsa := &allocationv1.GameServerAllocation{
 			ObjectMeta: metav1.ObjectMeta{
-				Namespace:   defaultNs,
-				Name:        "alloc1",
-				ClusterName: "multicluster",
+				Namespace: defaultNs,
+				Name:      "alloc1",
 			},
 			Spec: allocationv1.GameServerAllocationSpec{
 				MultiClusterSetting: allocationv1.MultiClusterSetting{
@@ -420,9 +428,8 @@ func TestMultiClusterAllocationFromRemote(t *testing.T) {
 
 		gsa := &allocationv1.GameServerAllocation{
 			ObjectMeta: metav1.ObjectMeta{
-				Namespace:   defaultNs,
-				Name:        "alloc1",
-				ClusterName: "localcluster",
+				Namespace: defaultNs,
+				Name:      "alloc1",
 			},
 			Spec: allocationv1.GameServerAllocationSpec{
 				MultiClusterSetting: allocationv1.MultiClusterSetting{
@@ -524,9 +531,8 @@ func TestMultiClusterAllocationFromRemote(t *testing.T) {
 
 		gsa := &allocationv1.GameServerAllocation{
 			ObjectMeta: metav1.ObjectMeta{
-				Namespace:   defaultNs,
-				Name:        "alloc1",
-				ClusterName: "localcluster",
+				Namespace: defaultNs,
+				Name:      "alloc1",
 			},
 			Spec: allocationv1.GameServerAllocationSpec{
 				MultiClusterSetting: allocationv1.MultiClusterSetting{
@@ -603,9 +609,8 @@ func TestMultiClusterAllocationFromRemote(t *testing.T) {
 
 		gsa := &allocationv1.GameServerAllocation{
 			ObjectMeta: metav1.ObjectMeta{
-				Namespace:   defaultNs,
-				Name:        "alloc1",
-				ClusterName: "localcluster",
+				Namespace: defaultNs,
+				Name:      "alloc1",
 			},
 			Spec: allocationv1.GameServerAllocationSpec{
 				MultiClusterSetting: allocationv1.MultiClusterSetting{
@@ -671,9 +676,8 @@ func TestMultiClusterAllocationFromRemote(t *testing.T) {
 
 		gsa := &allocationv1.GameServerAllocation{
 			ObjectMeta: metav1.ObjectMeta{
-				Namespace:   defaultNs,
-				Name:        "alloc1",
-				ClusterName: "localcluster",
+				Namespace: defaultNs,
+				Name:      "alloc1",
 			},
 			Spec: allocationv1.GameServerAllocationSpec{
 				MultiClusterSetting: allocationv1.MultiClusterSetting{
@@ -745,9 +749,8 @@ func TestMultiClusterAllocationFromRemote(t *testing.T) {
 
 		gsa := &allocationv1.GameServerAllocation{
 			ObjectMeta: metav1.ObjectMeta{
-				Namespace:   defaultNs,
-				Name:        "alloc1",
-				ClusterName: "localcluster",
+				Namespace: defaultNs,
+				Name:      "alloc1",
 			},
 			Spec: allocationv1.GameServerAllocationSpec{
 				MultiClusterSetting: allocationv1.MultiClusterSetting{
@@ -763,7 +766,7 @@ func TestMultiClusterAllocationFromRemote(t *testing.T) {
 	})
 }
 
-func executeAllocation(gsa *allocationv1.GameServerAllocation, c *Controller) (*allocationv1.GameServerAllocation, error) {
+func executeAllocation(gsa *allocationv1.GameServerAllocation, c *Extensions) (*allocationv1.GameServerAllocation, error) {
 	r, err := createRequest(gsa)
 	if err != nil {
 		return nil, err
@@ -835,17 +838,17 @@ func defaultFixtures(gsLen int) (*agonesv1.Fleet, []agonesv1.GameServer) {
 }
 
 // newFakeController returns a controller, backed by the fake Clientset
-func newFakeController() (*Controller, agtesting.Mocks) {
+func newFakeController() (*Extensions, agtesting.Mocks) {
 	return newFakeControllerWithTimeout(10*time.Second, 30*time.Second)
 }
 
 // newFakeController returns a controller, backed by the fake Clientset with custom allocation timeouts
-func newFakeControllerWithTimeout(remoteAllocationTimeout time.Duration, totalRemoteAllocationTimeout time.Duration) (*Controller, agtesting.Mocks) {
+func newFakeControllerWithTimeout(remoteAllocationTimeout time.Duration, totalRemoteAllocationTimeout time.Duration) (*Extensions, agtesting.Mocks) {
 	m := agtesting.NewMocks()
 	m.Mux = http.NewServeMux()
 	counter := gameservers.NewPerNodeCounter(m.KubeInformerFactory, m.AgonesInformerFactory)
 	api := apiserver.NewAPIServer(m.Mux)
-	c := NewController(api, healthcheck.NewHandler(), counter, m.KubeClient, m.KubeInformerFactory, m.AgonesClient, m.AgonesInformerFactory, remoteAllocationTimeout, totalRemoteAllocationTimeout, 500*time.Millisecond)
+	c := NewExtensions(api, healthcheck.NewHandler(), counter, m.KubeClient, m.KubeInformerFactory, m.AgonesClient, m.AgonesInformerFactory, remoteAllocationTimeout, totalRemoteAllocationTimeout, 500*time.Millisecond)
 	c.recorder = m.FakeRecorder
 	c.allocator.recorder = m.FakeRecorder
 	return c, m

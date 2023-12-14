@@ -24,7 +24,7 @@ Optionally, we also recommend starting with an `agones` profile, using `-p` to k
 clusters you may have running with Minikube.
 
 ```bash
-minikube start --kubernetes-version v{{% k8s-version %}}.{{% minikube-k8s-minor-version %}} -p agones
+minikube start --kubernetes-version v{{% minikube-example-cluster-version %}} -p agones
 ```
 
 Check the official [minikube start](https://minikube.sigs.k8s.io/docs/commands/start/) reference for more options that
@@ -54,7 +54,7 @@ via Agones exposed ports.
 
 **Windows (amd64)**
 * hyper-v (might need
-  <a href="https://blog.thepolyglotprogrammer.com/setting-up-kubernetes-on-wsl-to-work-with-minikube-on-windows-10-90dac3c72fa1" data-proofer-ignore>this blog post</a>
+  <a href="https://blog.thepolyglotprogrammer.com/setting-up-kubernetes-on-wsl-to-work-with-minikube-on-windows-10-90dac3c72fa1">this blog post</a>
   and/or [this comment](https://github.com/microsoft/WSL/issues/4288#issuecomment-652259640) for WSL support)
 
 _If you have successfully tested with other platforms and drivers, please click "edit this page" in the top right hand

@@ -1,4 +1,4 @@
-// Copyright 2022 Google LLC All Rights Reserved.
+// Copyright 2023 Google LLC All Rights Reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -39,8 +39,7 @@ type Interface interface {
 	MulticlusterV1() multiclusterv1.MulticlusterV1Interface
 }
 
-// Clientset contains the clients for groups. Each group has exactly one
-// version included in a Clientset.
+// Clientset contains the clients for groups.
 type Clientset struct {
 	*discovery.DiscoveryClient
 	agonesV1       *agonesv1.AgonesV1Client

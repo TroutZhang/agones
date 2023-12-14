@@ -23,6 +23,8 @@ import (
 	"agones.dev/agones/pkg/util/runtime"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/wrapperspb"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -71,6 +73,19 @@ func ConvertAllocationRequestToGSA(in *pb.AllocationRequest) *allocationv1.GameS
 		// nolint:staticcheck
 		gsa.Spec.Required = *selector
 	}
+
+	if runtime.FeatureEnabled(runtime.FeatureCountsAndLists) {
+		if in.Priorities != nil {
+			gsa.Spec.Priorities = convertAllocationPrioritiesToGSAPriorities(in.GetPriorities())
+		}
+		if in.Counters != nil {
+			gsa.Spec.Counters = convertAllocationCountersToGSACounterActions(in.GetCounters())
+		}
+		if in.Lists != nil {
+			gsa.Spec.Lists = convertAllocationListsToGSAListActions(in.GetLists())
+		}
+	}
+
 	return gsa
 }
 
@@ -103,13 +118,27 @@ func ConvertGSAToAllocationRequest(in *allocationv1.GameServerAllocation) *pb.Al
 	l := len(out.GameServerSelectors)
 	if l > 0 {
 		// nolint:staticcheck
+		// Sets all but the last GameServerSelector as PreferredGameServerSelectors
 		out.PreferredGameServerSelectors = out.GameServerSelectors[:l-1]
 		// nolint:staticcheck
+		// Sets the last GameServerSelector as RequiredGameServerSelector
 		out.RequiredGameServerSelector = out.GameServerSelectors[l-1]
 	}
 
 	if in.Spec.MultiClusterSetting.Enabled {
 		out.MultiClusterSetting.PolicySelector = convertInternalLabelSelectorToLabelSelector(&in.Spec.MultiClusterSetting.PolicySelector)
+	}
+
+	if runtime.FeatureEnabled(runtime.FeatureCountsAndLists) {
+		if in.Spec.Priorities != nil {
+			out.Priorities = convertGSAPrioritiesToAllocationPriorities(in.Spec.Priorities)
+		}
+		if in.Spec.Counters != nil {
+			out.Counters = convertGSACounterActionsToAllocationCounters(in.Spec.Counters)
+		}
+		if in.Spec.Lists != nil {
+			out.Lists = convertGSAListActionsToAllocationLists(in.Spec.Lists)
+		}
 	}
 
 	return out
@@ -152,21 +181,43 @@ func convertGameServerSelectorToInternalGameServerSelector(in *pb.GameServerSele
 		LabelSelector: metav1.LabelSelector{MatchLabels: in.GetMatchLabels()},
 	}
 
-	if runtime.FeatureEnabled(runtime.FeatureStateAllocationFilter) {
-		switch in.GameServerState {
-		case pb.GameServerSelector_ALLOCATED:
-			allocated := agonesv1.GameServerStateAllocated
-			result.GameServerState = &allocated
-		case pb.GameServerSelector_READY:
-			ready := agonesv1.GameServerStateReady
-			result.GameServerState = &ready
-		}
+	switch in.GameServerState {
+	case pb.GameServerSelector_ALLOCATED:
+		allocated := agonesv1.GameServerStateAllocated
+		result.GameServerState = &allocated
+	case pb.GameServerSelector_READY:
+		ready := agonesv1.GameServerStateReady
+		result.GameServerState = &ready
 	}
 
 	if runtime.FeatureEnabled(runtime.FeaturePlayerAllocationFilter) && in.Players != nil {
 		result.Players = &allocationv1.PlayerSelector{
 			MinAvailable: int64(in.Players.MinAvailable),
 			MaxAvailable: int64(in.Players.MaxAvailable),
+		}
+	}
+
+	if runtime.FeatureEnabled(runtime.FeatureCountsAndLists) {
+		if in.Counters != nil {
+			result.Counters = map[string]allocationv1.CounterSelector{}
+			for k, v := range in.GetCounters() {
+				result.Counters[k] = allocationv1.CounterSelector{
+					MinCount:     v.MinCount,
+					MaxCount:     v.MaxCount,
+					MinAvailable: v.MinAvailable,
+					MaxAvailable: v.MaxAvailable,
+				}
+			}
+		}
+		if in.Lists != nil {
+			result.Lists = map[string]allocationv1.ListSelector{}
+			for k, v := range in.GetLists() {
+				result.Lists[k] = allocationv1.ListSelector{
+					ContainsValue: v.ContainsValue,
+					MinAvailable:  v.MinAvailable,
+					MaxAvailable:  v.MaxAvailable,
+				}
+			}
 		}
 	}
 
@@ -181,7 +232,7 @@ func convertInternalGameServerSelectorToGameServer(in *allocationv1.GameServerSe
 		MatchLabels: in.MatchLabels,
 	}
 
-	if runtime.FeatureEnabled(runtime.FeatureStateAllocationFilter) && in.GameServerState != nil {
+	if in.GameServerState != nil {
 		switch *in.GameServerState {
 		case agonesv1.GameServerStateReady:
 			result.GameServerState = pb.GameServerSelector_READY
@@ -194,6 +245,30 @@ func convertInternalGameServerSelectorToGameServer(in *allocationv1.GameServerSe
 		result.Players = &pb.PlayerSelector{
 			MinAvailable: uint64(in.Players.MinAvailable),
 			MaxAvailable: uint64(in.Players.MaxAvailable),
+		}
+	}
+
+	if runtime.FeatureEnabled(runtime.FeatureCountsAndLists) {
+		if in.Counters != nil {
+			result.Counters = map[string]*pb.CounterSelector{}
+			for k, v := range in.Counters {
+				result.Counters[k] = &pb.CounterSelector{
+					MinCount:     v.MinCount,
+					MaxCount:     v.MaxCount,
+					MinAvailable: v.MinAvailable,
+					MaxAvailable: v.MaxAvailable,
+				}
+			}
+		}
+		if in.Lists != nil {
+			result.Lists = map[string]*pb.ListSelector{}
+			for k, v := range in.Lists {
+				result.Lists[k] = &pb.ListSelector{
+					ContainsValue: v.ContainsValue,
+					MinAvailable:  v.MinAvailable,
+					MaxAvailable:  v.MaxAvailable,
+				}
+			}
 		}
 	}
 
@@ -240,13 +315,16 @@ func ConvertGSAToAllocationResponse(in *allocationv1.GameServerAllocation) (*pb.
 	return &pb.AllocationResponse{
 		GameServerName: in.Status.GameServerName,
 		Address:        in.Status.Address,
+		Addresses:      convertGSAAddressesToAllocationAddresses(in.Status.Addresses),
 		NodeName:       in.Status.NodeName,
 		Ports:          convertGSAAgonesPortsToAllocationPorts(in.Status.Ports),
+		Source:         in.Status.Source,
+		Metadata:       convertGSAMetadataToAllocationMetadata(in.Status.Metadata),
 	}, nil
 }
 
 // ConvertAllocationResponseToGSA converts AllocationResponse to GameServerAllocation V1 (GSA)
-func ConvertAllocationResponseToGSA(in *pb.AllocationResponse) *allocationv1.GameServerAllocation {
+func ConvertAllocationResponseToGSA(in *pb.AllocationResponse, rs string) *allocationv1.GameServerAllocation {
 	if in == nil {
 		return nil
 	}
@@ -256,13 +334,40 @@ func ConvertAllocationResponseToGSA(in *pb.AllocationResponse) *allocationv1.Gam
 			State:          allocationv1.GameServerAllocationAllocated,
 			GameServerName: in.GameServerName,
 			Address:        in.Address,
+			Addresses:      convertAllocationAddressesToGSAAddresses(in.Addresses),
 			NodeName:       in.NodeName,
 			Ports:          convertAllocationPortsToGSAAgonesPorts(in.Ports),
+			Source:         rs,
+			Metadata:       convertAllocationMetadataToGSAMetadata(in.Metadata),
 		},
 	}
 	out.SetGroupVersionKind(allocationv1.SchemeGroupVersion.WithKind("GameServerAllocation"))
 
 	return out
+}
+
+// convertGSAAddressesToAllocationAddresses converts corev1.NodeAddress to AllocationResponse_GameServerStatusAddress
+func convertGSAAddressesToAllocationAddresses(in []corev1.NodeAddress) []*pb.AllocationResponse_GameServerStatusAddress {
+	var addresses []*pb.AllocationResponse_GameServerStatusAddress
+	for _, addr := range in {
+		addresses = append(addresses, &pb.AllocationResponse_GameServerStatusAddress{
+			Type:    string(addr.Type),
+			Address: addr.Address,
+		})
+	}
+	return addresses
+}
+
+// convertAllocationAddressesToGSAAddresses converts AllocationResponse_GameServerStatusAddress to corev1.NodeAddress
+func convertAllocationAddressesToGSAAddresses(in []*pb.AllocationResponse_GameServerStatusAddress) []corev1.NodeAddress {
+	var addresses []corev1.NodeAddress
+	for _, addr := range in {
+		addresses = append(addresses, corev1.NodeAddress{
+			Type:    corev1.NodeAddressType(addr.Type),
+			Address: addr.Address,
+		})
+	}
+	return addresses
 }
 
 // convertGSAAgonesPortsToAllocationPorts converts GameServerStatusPort V1 (GSA) to AllocationResponse_GameServerStatusPort
@@ -291,6 +396,26 @@ func convertAllocationPortsToGSAAgonesPorts(in []*pb.AllocationResponse_GameServ
 	return out
 }
 
+func convertGSAMetadataToAllocationMetadata(in *allocationv1.GameServerMetadata) *pb.AllocationResponse_GameServerMetadata {
+	if in == nil {
+		return nil
+	}
+	metadata := &pb.AllocationResponse_GameServerMetadata{}
+	metadata.Labels = in.Labels
+	metadata.Annotations = in.Annotations
+	return metadata
+}
+
+func convertAllocationMetadataToGSAMetadata(in *pb.AllocationResponse_GameServerMetadata) *allocationv1.GameServerMetadata {
+	if in == nil {
+		return nil
+	}
+	metadata := &allocationv1.GameServerMetadata{}
+	metadata.Labels = in.Labels
+	metadata.Annotations = in.Annotations
+	return metadata
+}
+
 // convertStateV1ToError converts GameServerAllocationState V1 (GSA) to AllocationResponse_GameServerAllocationState
 func convertStateV1ToError(in allocationv1.GameServerAllocationState) error {
 	switch in {
@@ -302,4 +427,157 @@ func convertStateV1ToError(in allocationv1.GameServerAllocationState) error {
 		return status.Error(codes.Aborted, "too many concurrent requests have overwhelmed the system")
 	}
 	return status.Error(codes.Unknown, "unknown issue")
+}
+
+// convertAllocationPrioritiesToGSAPriorities converts a list of AllocationRequest_Priorities to a
+// list of GameServerAllocationSpec (GSA.Spec) Priorities
+func convertAllocationPrioritiesToGSAPriorities(in []*pb.Priority) []agonesv1.Priority {
+	var out []agonesv1.Priority
+	for _, p := range in {
+		var t string
+		var o string
+		switch p.Type {
+		case pb.Priority_List:
+			t = agonesv1.GameServerPriorityList
+		default: // case pb.Priority_Counter and case nil
+			t = agonesv1.GameServerPriorityCounter
+		}
+		switch p.Order {
+		case pb.Priority_Descending:
+			o = agonesv1.GameServerPriorityDescending
+		default: // case pb.Priority_Ascending and case nil
+			o = agonesv1.GameServerPriorityAscending
+		}
+		priority := agonesv1.Priority{
+			Type:  t,
+			Key:   p.Key,
+			Order: o,
+		}
+		out = append(out, priority)
+	}
+	return out
+}
+
+// convertAllocationPrioritiesToGSAPriorities converts a list of GameServerAllocationSpec (GSA.Spec)
+// Priorities to a list of AllocationRequest_Priorities
+func convertGSAPrioritiesToAllocationPriorities(in []agonesv1.Priority) []*pb.Priority {
+	var out []*pb.Priority
+	for _, p := range in {
+		var pt pb.Priority_Type
+		var po pb.Priority_Order
+		switch p.Type {
+		case agonesv1.GameServerPriorityList:
+			pt = pb.Priority_List
+		default: // case agonesv1.GameServerPriorityCounter and case nil
+			pt = pb.Priority_Counter
+		}
+		switch p.Order {
+		case agonesv1.GameServerPriorityDescending:
+			po = pb.Priority_Descending
+		default: // case agonesv1.GameServerPriorityAscending and case nil
+			po = pb.Priority_Ascending
+		}
+		priority := pb.Priority{
+			Type:  pt,
+			Key:   p.Key,
+			Order: po,
+		}
+		out = append(out, &priority)
+	}
+	return out
+}
+
+// convertAllocationCountersToGSACounterActions converts a map of AllocationRequest_Counters to a
+// map of GameServerAllocationSpec CounterActions
+func convertAllocationCountersToGSACounterActions(in map[string]*pb.CounterAction) map[string]allocationv1.CounterAction {
+	out := map[string]allocationv1.CounterAction{}
+	for k, v := range in {
+		ca := allocationv1.CounterAction{}
+
+		if v.Action != nil {
+			action := v.Action.GetValue()
+			ca.Action = &action
+		}
+		if v.Amount != nil {
+			amount := v.Amount.GetValue()
+			ca.Amount = &amount
+		}
+		if v.Capacity != nil {
+			capacity := v.Capacity.GetValue()
+			ca.Capacity = &capacity
+		}
+
+		out[k] = ca
+	}
+	return out
+}
+
+// convertGSACounterActionsToAllocationCounters converts a map of GameServerAllocationSpec CounterActions
+// to a map of AllocationRequest_Counters
+func convertGSACounterActionsToAllocationCounters(in map[string]allocationv1.CounterAction) map[string]*pb.CounterAction {
+	out := map[string]*pb.CounterAction{}
+
+	for k, v := range in {
+		ca := pb.CounterAction{}
+
+		if v.Action != nil {
+			ca.Action = wrapperspb.String(*v.Action)
+		}
+		if v.Amount != nil {
+			ca.Amount = wrapperspb.Int64(*v.Amount)
+		}
+		if v.Capacity != nil {
+			ca.Capacity = wrapperspb.Int64(*v.Capacity)
+		}
+
+		out[k] = &ca
+	}
+	return out
+}
+
+// convertAllocationListsToGSAListActions converts a map of AllocationRequest_Lists to a
+// map of GameServerAllocationSpec ListActions
+func convertAllocationListsToGSAListActions(in map[string]*pb.ListAction) map[string]allocationv1.ListAction {
+	out := map[string]allocationv1.ListAction{}
+
+	for k, v := range in {
+		la := allocationv1.ListAction{}
+
+		if v.AddValues != nil {
+			addValues := v.GetAddValues()
+			copyValues := make([]string, len(addValues))
+			copy(copyValues, addValues)
+			la.AddValues = copyValues
+		}
+		if v.Capacity != nil {
+			capacity := v.Capacity.GetValue()
+			la.Capacity = &capacity
+		}
+
+		out[k] = la
+	}
+
+	return out
+}
+
+// convertGSAListActionsToAllocationLists converts a map of GameServerAllocationSpec ListActions
+// to a map of AllocationRequest_Lists
+func convertGSAListActionsToAllocationLists(in map[string]allocationv1.ListAction) map[string]*pb.ListAction {
+	out := map[string]*pb.ListAction{}
+
+	for k, v := range in {
+		la := pb.ListAction{}
+
+		if v.AddValues != nil {
+			copyValues := make([]string, len(v.AddValues))
+			copy(copyValues, v.AddValues)
+			la.AddValues = copyValues
+		}
+		if v.Capacity != nil {
+			la.Capacity = wrapperspb.Int64(*v.Capacity)
+		}
+
+		out[k] = &la
+	}
+	return out
 }

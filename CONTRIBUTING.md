@@ -86,6 +86,17 @@ build system.
 See the [Container Builder documentation](https://cloud.google.com/container-builder/docs/) for more details on
 how to edit and expand the build process.
 
+## Kubernetes Versions Update
+### When to update supported Kubernetes Versions
+As documented in the [version update policy](https://agones.dev/site/docs/installation/#agones-and-kubernetes-supported-versions), each version of Agones supports 3 releases of Kubernetes. The newest supported version is the latest available version in the GKE Rapid channel and at least one of the 3 supported version is supported by each of the major cloud providers (EKS and AKS). This means whenever a new minor version is available in the [GKE Rapid channel](https://cloud.google.com/kubernetes-engine/docs/release-notes-rapid), we should check whether we can roll forward the supported versions.
+### How to update supported Kubernetes Versions
+Please follow the steps below to update the Kubernetes versions supported.
+
+1. Create a Issue from the [kubernetes update issue template](./.github/ISSUE_TEMPLATE/kubernetes_update.md) with the newly supported versions.
+2. Complete all items in the issue checklist.
+3. Close the issue.
+
+
 ## Community Meetings
 
 Community meetings occur every month, and are open to all who wish to attend!

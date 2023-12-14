@@ -17,10 +17,18 @@
 #include "Engine/World.h"
 #include "HttpModule.h"
 #include "Interfaces/IHttpResponse.h"
-#include "JsonUtilities/Public/JsonObjectConverter.h"
+#include "JsonObjectConverter.h"
 #include "TimerManager.h"
-#include "WebSockets/Public/IWebSocket.h"
-#include "WebSockets/Public/WebSocketsModule.h"
+#include "IWebSocket.h"
+#include "WebSocketsModule.h"
+
+DEFINE_LOG_CATEGORY_STATIC(LogAgones, Log, Log);
+
+#if ENGINE_MAJOR_VERSION > 4
+typedef UTF8CHAR UTF8FromType;
+#else
+typedef ANSICHAR UTF8FromType;
+#endif
 
 UAgonesComponent::UAgonesComponent()
 {
@@ -206,6 +214,7 @@ void UAgonesComponent::WatchGameServer(const FGameServerDelegate WatchDelegate)
         !JsonObject->TryGetObjectField(TEXT("result"), ResultObject) ||
         !ResultObject->IsValid())
     {
+        UE_LOG(LogAgones, Error, TEXT("Failed to parse json: %s"), *JsonString);
         return;
     }
 
@@ -221,22 +230,22 @@ void UAgonesComponent::WatchGameServer(const FGameServerDelegate WatchDelegate)
 
 void UAgonesComponent::HandleWatchMessage(const void* Data, SIZE_T Size, SIZE_T BytesRemaining)
 {
-    if (BytesRemaining > 0)
-    {
-        WatchMessageBuffer.Append(UTF8_TO_TCHAR(static_cast<const UTF8CHAR*>(Data)), Size);
-        return;
-    }
+	if (BytesRemaining <= 0 && (WatchMessageBuffer.Num() == 0))
+	{
+		FUTF8ToTCHAR Message(static_cast<const UTF8FromType*>(Data), Size);
+		DeserializeAndBroadcastWatch(FString(Message.Length(), Message.Get()));
+		return;
+	}
 
-    FString const Message = FString(Size, UTF8_TO_TCHAR(static_cast<const UTF8CHAR*>(Data)));
+	WatchMessageBuffer.Insert(static_cast<const UTF8CHAR*>(Data), Size, WatchMessageBuffer.Num());
+	if (BytesRemaining > 0)
+	{
+		return;
+	}
 
-    // If the LHS of FString + is empty, it just uses the RHS directly so there's no copy here with an empty buffer.
-    DeserializeAndBroadcastWatch(WatchMessageBuffer + Message);
-
-    // Faster to check and then empty vs blindly emptying - normal case is that the buffer is already empty
-    if (!WatchMessageBuffer.IsEmpty())
-    {
-        WatchMessageBuffer.Empty();
-    }
+	FUTF8ToTCHAR Message((const UTF8FromType*)WatchMessageBuffer.GetData(), WatchMessageBuffer.Num());
+	DeserializeAndBroadcastWatch(FString(Message.Length(), Message.Get()));
+	WatchMessageBuffer.Empty();
 }
 
 void UAgonesComponent::SetLabel(
@@ -438,7 +447,7 @@ void UAgonesComponent::SetPlayerCapacity(
 		return;
 	}
 
-	FHttpRequestRef Request = BuildAgonesRequest("alpha/player/capacity", FHttpVerb::Post, Json);
+	FHttpRequestRef Request = BuildAgonesRequest("alpha/player/capacity", FHttpVerb::Put, Json);
 	Request->OnProcessRequestComplete().BindWeakLambda(this,
 		[SuccessDelegate, ErrorDelegate](FHttpRequestPtr HttpRequest, FHttpResponsePtr HttpResponse, const bool bSucceeded) {
 			if (!IsValidResponse(bSucceeded, HttpResponse, ErrorDelegate))

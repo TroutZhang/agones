@@ -1,3 +1,4 @@
+---
 # Copyright 2018 Google LLC All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -19,9 +20,9 @@ metadata:
   name: agones-gameservers
   namespace: metrics
   labels:
-    grafana_dashboard: "1"
+    grafana_dashboard: '1'
 data:
-  dashboard-agones-gameservers.json: |
+  dashboard-agones-gameservers.json: |-
     {
       "annotations": {
         "list": [
@@ -103,7 +104,6 @@ data:
           "links": [],
           "nullPointMode": "connected",
           "pieType": "pie",
-          "pluginVersion": "7.2.1",
           "strokeWidth": 1,
           "targets": [
             {
@@ -167,7 +167,6 @@ data:
             "alertThreshold": true
           },
           "percentage": false,
-          "pluginVersion": "7.2.1",
           "pointradius": 5,
           "points": false,
           "renderer": "flot",
@@ -270,7 +269,6 @@ data:
             "alertThreshold": true
           },
           "percentage": false,
-          "pluginVersion": "7.2.1",
           "pointradius": 5,
           "points": false,
           "renderer": "flot",
@@ -376,7 +374,6 @@ data:
             "alertThreshold": true
           },
           "percentage": false,
-          "pluginVersion": "7.2.1",
           "pointradius": 5,
           "points": false,
           "renderer": "flot",
@@ -477,7 +474,6 @@ data:
             "alertThreshold": true
           },
           "percentage": false,
-          "pluginVersion": "7.2.1",
           "pointradius": 5,
           "points": false,
           "renderer": "flot",
@@ -615,7 +611,6 @@ data:
             "alertThreshold": true
           },
           "percentage": false,
-          "pluginVersion": "7.2.1",
           "pointradius": 5,
           "points": false,
           "renderer": "flot",
@@ -703,14 +698,14 @@ data:
               ]
             },
             "datasource": "Prometheus",
-            "definition": "label_values(agones_gameservers_count, fleet_name)\t",
+            "definition": "label_values(agones_gameservers_count, fleet_name)",
             "hide": 0,
             "includeAll": true,
             "label": null,
             "multi": true,
             "name": "fleet",
             "options": [],
-            "query": "label_values(agones_gameservers_count, fleet_name)\t",
+            "query": "label_values(agones_gameservers_count, fleet_name)",
             "refresh": 2,
             "regex": "",
             "skipUrlSync": false,

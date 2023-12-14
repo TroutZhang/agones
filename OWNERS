@@ -2,10 +2,8 @@
 
 approvers:
   - cyriltovena
-  - dzlier-gcp
   - EricFortin
   - markmandel
-  - pooneh-m
   - roberthbailey
   - aLekSer
 
@@ -13,3 +11,4 @@ emeritus_approvers:
   - joeholley
   - jkowalski
   - ilkercelikyilmaz
+  - pooneh-m

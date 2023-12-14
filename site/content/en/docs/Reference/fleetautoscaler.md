@@ -13,7 +13,7 @@ A full `FleetAutoscaler` specification is available below and in the
 apiVersion: "autoscaling.agones.dev/v1"
 kind: FleetAutoscaler
 # FleetAutoscaler Metadata
-# {{< k8s-api href="#objectmeta-v1-meta" >}}
+# {{< k8s-api-version href="#objectmeta-v1-meta" >}}
 metadata:
   name: fleet-autoscaler-example
 spec:
@@ -37,8 +37,6 @@ spec:
       # maximum fleet size that can be set by this FleetAutoscaler
       # required
       maxReplicas: 20
-  # [Stage:Beta]
-  # [FeatureFlag:CustomFasSyncInterval]
   # The autoscaling sync strategy
   sync:
     # type of the sync. for now, only FixedInterval is available

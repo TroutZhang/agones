@@ -1,0 +1,18 @@
+---
+extends: default
+
+rules:
+  truthy: disable
+  line-length:
+    max: 1500
+
+ignore:
+  - /build/.gomod/
+  - /build/.config/
+  - /install/
+  - /sdks/
+  - /test/sdk/
+  - /site/node_modules/
+  - /site/themes/docsy/
+  - /site/vendor/
+  - /vendor/

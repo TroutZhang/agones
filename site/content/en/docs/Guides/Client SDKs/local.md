@@ -13,25 +13,31 @@ namespace as it - usually referred to in Kubernetes terms as a "sidecar".
 
 Therefore, when developing locally, we also need a process for the SDK to connect to!
 
-To do this, we can run the same binary that runs inside Agones, but pass in a flag
+To do this, we can run the same binary (the SDK Server) that runs inside Agones, but pass in a flag
 to run it in "local mode". Local mode means that the sidecar binary
 will not try to connect to anything, and will just send log messages to stdout and persist local state in memory so
 that you can see exactly what the SDK in your game server is doing, and can
 confirm everything works.
 
-To do this you will need to download {{% ghrelease file_prefix="agonessdk-server" %}}, and unzip it.
+## Running the SDK Server
+
+To run the SDK Server, you will need a copy of the binary.
+This can either be done by downloading a prebuilt binary or running from source code.
+This guide will focus on running from the prebuilt binary, but details about running from source code can be found [below](#running-from-source-code-instead-of-prebuilt-binary).
+
+To run the prebuilt binary, for the latest release, you will need to download {{% ghrelease file_prefix="agonessdk-server" %}}, and unzip it.
 You will find the executables for the SDK server, for each type of operating system.
 
-macOS
-* sdk-server.darwin.amd64
-* sdk-server.darwin.arm64
+* MacOS
+  * sdk-server.darwin.amd64
+  * sdk-server.darwin.arm64
+* Linux
+  * sdk-server.linux.amd64
+  * sdk-server.linux.arm64
+* Windows
+  * sdk-server.windows.amd64.exe
 
-Linux
-* sdk-server.linux.amd64
-* sdk-server.linux.arm64
-
-Windows
-* sdk-server.windows.amd64.exe
+### Running In "Local Mode"
 
 To run in local mode, pass the flag `--local` to the executable.
 
@@ -40,6 +46,8 @@ For example:
 ```bash
 ./sdk-server.linux.amd64 --local
 ```
+
+You should see output similar to the following:
 ```
 {"ctlConf":{"Address":"localhost","IsLocal":true,"LocalFile":"","Delay":0,"Timeout":0,"Test":"","GRPCPort":9357,"HTTPPort":9358},"message":"Starting sdk sidecar","severity":"info","source":"main","time":"2019-10-30T21:44:37.973139+03:00","version":"1.1.0"}
 {"grpcEndpoint":"localhost:9357","message":"Starting SDKServer grpc service...","severity":"info","source":"main","time":"2019-10-30T21:44:37.974585+03:00"}
@@ -123,13 +131,13 @@ Once you have your game server process in a container, you may also want to test
 Since the production agones-sdk binary has the `--local` mode built in, you can also use the production container image
 locally as well!
 
-Since the SDK and your game server container need to share a port on `localhost`, one of the easiest ways to do that 
+Since the SDK and your game server container need to share a port on `localhost`, one of the easiest ways to do that
 is to have them both run using the host network, like so:
 
 In one shell run:
 
 ```shell
-docker run --network=host --rm gcr.io/agones-images/agones-sdk:{{< release-version >}} --local
+docker run --network=host --rm us-docker.pkg.dev/agones-images/release/agones-sdk:{{< release-version >}} --local
 ```
 
 You should see a similar output to what you would if you were running the binary directly, i.e. outside a container.
@@ -140,12 +148,65 @@ Then in another shell, start your game server container:
 docker run --network=host --rm <your image here>
 ```
 
-If you want to [mount a custom `gameserver.yaml`](#providing-your-own-gameserver-configuration-for-local-development), 
-this is also possible:  
+If you want to [mount a custom `gameserver.yaml`](#providing-your-own-gameserver-configuration-for-local-development),
+this is also possible:
 
 ```bash
 wget https://raw.githubusercontent.com/googleforgames/agones/{{< release-branch >}}/examples/simple-game-server/gameserver.yaml
 # required so that the `agones` user in the container can read the file
 chmod o+r gameserver.yaml
-docker run --network=host --rm -v $(pwd)/gameserver.yaml:/tmp/gameserver.yaml gcr.io/agones-images/agones-sdk:{{<release-version>}} --local -f /tmp/gameserver.yaml
+docker run --network=host --rm -v $(pwd)/gameserver.yaml:/tmp/gameserver.yaml us-docker.pkg.dev/agones-images/release/agones-sdk:{{<release-version>}} --local -f /tmp/gameserver.yaml
 ```
+
+If you run Docker on a OS that doesn't run Docker natively or in a VM, such as on Windows or macOS, you may want to to run the ClientSDK and your game server container together with [Docker Compose](https://docs.docker.com/compose/). To do so, create a `docker-compose.yaml` file setup with a network overlay shared between them:
+
+```yaml
+version: '3'
+services:
+  gameserver:
+    build: . # <path to build context>
+    ports:
+      - "127.0.0.1:7777:7777/udp"
+
+  sdk-server:
+    image: "us-docker.pkg.dev/agones-images/release/agones-sdk:{{<release-version>}}"
+    command: --local -f /gs_config
+    network_mode: service:gameserver # <shared network between sdk and game server>
+    configs:
+      - gs_config
+
+configs:
+  gs_config:
+    file: ./gameserver.yaml
+```
+
+Run `docker-compose`
+
+```shell
+docker-compose up --build
+```
+
+## Running from source code instead of prebuilt binary
+
+If you wish to run from source rather than pre-built binaries, that is an available alternative.
+You will need [Go installed](https://go.dev/doc/install) and will need to clone the [Agones GitHub repo](https://github.com/googleforgames/agones).
+
+**Disclaimer:** Agones is run and tested with the version of Go specified by the `GO_VERSION` variable in the project's [build Dockerfile](https://github.com/googleforgames/agones/blob/main/build/build-image/Dockerfile). Other versions are not supported, but may still work.
+
+Your cloned repository is best switched to the latest specific release's branch/tag. For example:
+```bash
+git clone https://github.com/googleforgames/agones.git
+cd agones
+git checkout release-{{< release-version >}}
+```
+
+With Go installed and the Agones repository cloned, the SDK Server can be run with the following command (from the Agones clone directory):
+```bash
+go run cmd/sdk-server/main.go --local
+```
+
+Commandline flags (e.g. `--local`) are exactly the same as command line flags when utilising a pre-built binary.
+
+## Next Steps:
+
+- Learn how to connect your local development game server binary into a running Agones Kubernetes cluster for even more live development options with an [out of cluster dev server]({{< ref "/docs/Advanced/out-of-cluster-dev-server.md" >}}).

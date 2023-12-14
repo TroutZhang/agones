@@ -1,25 +1,28 @@
 module agones.dev/agones/examples/allocation-endpoint/server
 
-go 1.19
+go 1.20
 
 require (
-	agones.dev/agones v1.21.0
+	agones.dev/agones v1.35.0
 	github.com/pkg/errors v0.9.1
-	github.com/sirupsen/logrus v1.8.1
-	go.opencensus.io v0.23.0
-	golang.org/x/oauth2 v0.0.0-20211104180415-d3ed0bb246c8
-	google.golang.org/grpc v1.44.0
+	github.com/sirupsen/logrus v1.9.3
+	go.opencensus.io v0.24.0
+	golang.org/x/oauth2 v0.13.0
+	google.golang.org/grpc v1.59.0
 )
 
 require (
-	cloud.google.com/go v0.65.0 // indirect
-	github.com/golang/groupcache v0.0.0-20200121045136-8c9f03a8e57e // indirect
-	github.com/golang/protobuf v1.5.0 // indirect
-	github.com/grpc-ecosystem/grpc-gateway v1.16.0 // indirect
-	golang.org/x/net v0.0.0-20210224082022-3d97a244fca7 // indirect
-	golang.org/x/sys v0.0.0-20210426230700-d19ff857e887 // indirect
-	golang.org/x/text v0.3.4 // indirect
-	google.golang.org/appengine v1.6.6 // indirect
-	google.golang.org/genproto v0.0.0-20201110150050-8816d57aaa9a // indirect
-	google.golang.org/protobuf v1.26.0 // indirect
+	cloud.google.com/go/compute v1.23.1 // indirect
+	cloud.google.com/go/compute/metadata v0.2.3 // indirect
+	github.com/golang/groupcache v0.0.0-20210331224755-41bb18bfe9da // indirect
+	github.com/golang/protobuf v1.5.3 // indirect
+	github.com/grpc-ecosystem/grpc-gateway/v2 v2.18.0 // indirect
+	golang.org/x/net v0.17.0 // indirect
+	golang.org/x/sys v0.13.0 // indirect
+	golang.org/x/text v0.13.0 // indirect
+	google.golang.org/appengine v1.6.8 // indirect
+	google.golang.org/genproto v0.0.0-20231016165738-49dd2c1f3d0b // indirect
+	google.golang.org/genproto/googleapis/api v0.0.0-20231016165738-49dd2c1f3d0b // indirect
+	google.golang.org/genproto/googleapis/rpc v0.0.0-20231016165738-49dd2c1f3d0b // indirect
+	google.golang.org/protobuf v1.31.0 // indirect
 )

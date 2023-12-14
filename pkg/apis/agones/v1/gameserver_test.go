@@ -25,10 +25,12 @@ import (
 	"agones.dev/agones/pkg/apis/agones"
 	"agones.dev/agones/pkg/util/runtime"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/validation"
+	"k8s.io/apimachinery/pkg/util/validation/field"
 )
 
 const (
@@ -133,7 +135,20 @@ func TestGameServerApplyDefaults(t *testing.T) {
 
 	ten := int64(10)
 
+	defaultGameServerAnd := func(f func(gss *GameServerSpec)) GameServer {
+		gs := GameServer{
+			Spec: GameServerSpec{
+				Ports: []GameServerPort{{ContainerPort: 999}},
+				Template: corev1.PodTemplateSpec{
+					Spec: corev1.PodSpec{Containers: []corev1.Container{
+						{Name: "testing", Image: "testing/image"},
+					}}}},
+		}
+		f(&gs.Spec)
+		return gs
+	}
 	type expected struct {
+		container           string
 		protocol            corev1.Protocol
 		state               GameServerState
 		policy              PortPolicy
@@ -141,6 +156,34 @@ func TestGameServerApplyDefaults(t *testing.T) {
 		scheduling          apis.SchedulingStrategy
 		sdkServer           SdkServer
 		alphaPlayerCapacity *int64
+		alphaCounterSpec    map[string]CounterStatus
+		alphaListSpec       map[string]ListStatus
+		evictionSafeSpec    EvictionSafe
+		evictionSafeStatus  EvictionSafe
+	}
+	wantDefaultAnd := func(f func(e *expected)) expected {
+		e := expected{
+			container:  "testing",
+			protocol:   "UDP",
+			state:      GameServerStatePortAllocation,
+			policy:     Dynamic,
+			scheduling: apis.Packed,
+			health: Health{
+				Disabled:            false,
+				FailureThreshold:    3,
+				InitialDelaySeconds: 5,
+				PeriodSeconds:       5,
+			},
+			sdkServer: SdkServer{
+				LogLevel: SdkServerLogLevelInfo,
+				GRPCPort: 9357,
+				HTTPPort: 9358,
+			},
+			evictionSafeSpec:   EvictionSafeNever,
+			evictionSafeStatus: EvictionSafeNever,
+		}
+		f(&e)
+		return e
 	}
 	data := map[string]struct {
 		gameServer   GameServer
@@ -149,63 +192,47 @@ func TestGameServerApplyDefaults(t *testing.T) {
 		expected     expected
 	}{
 		"set basic defaults on a very simple gameserver": {
+			gameServer: defaultGameServerAnd(func(gss *GameServerSpec) {}),
+			expected:   wantDefaultAnd(func(e *expected) {}),
+		},
+		"PlayerTracking=true": {
 			featureFlags: string(runtime.FeaturePlayerTracking) + "=true",
-			gameServer: GameServer{
-				Spec: GameServerSpec{
-					Players: &PlayersSpec{InitialCapacity: 10},
-					Ports:   []GameServerPort{{ContainerPort: 999}},
-					Template: corev1.PodTemplateSpec{
-						Spec: corev1.PodSpec{Containers: []corev1.Container{
-							{Name: "testing", Image: "testing/image"},
-						}}}},
-			},
-			container: "testing",
-			expected: expected{
-				protocol:   "UDP",
-				state:      GameServerStatePortAllocation,
-				policy:     Dynamic,
-				scheduling: apis.Packed,
-				health: Health{
-					Disabled:            false,
-					FailureThreshold:    3,
-					InitialDelaySeconds: 5,
-					PeriodSeconds:       5,
-				},
-				sdkServer: SdkServer{
-					LogLevel: SdkServerLogLevelInfo,
-					GRPCPort: 9357,
-					HTTPPort: 9358,
-				},
-				alphaPlayerCapacity: &ten,
-			},
+			gameServer: defaultGameServerAnd(func(gss *GameServerSpec) {
+				gss.Players = &PlayersSpec{InitialCapacity: 10}
+			}),
+			expected: wantDefaultAnd(func(e *expected) {
+				e.alphaPlayerCapacity = &ten
+			}),
+		},
+		"CountsAndLists=true, Counters": {
+			featureFlags: string(runtime.FeatureCountsAndLists) + "=true",
+			gameServer: defaultGameServerAnd(func(gss *GameServerSpec) {
+				gss.Counters = make(map[string]CounterStatus)
+				gss.Counters["games"] = CounterStatus{Count: 1, Capacity: 100}
+			}),
+			expected: wantDefaultAnd(func(e *expected) {
+				e.alphaCounterSpec = make(map[string]CounterStatus)
+				e.alphaCounterSpec["games"] = CounterStatus{Count: 1, Capacity: 100}
+			}),
+		},
+		"CountsAndLists=true, Lists": {
+			featureFlags: string(runtime.FeatureCountsAndLists) + "=true",
+			gameServer: defaultGameServerAnd(func(gss *GameServerSpec) {
+				gss.Lists = make(map[string]ListStatus)
+				gss.Lists["players"] = ListStatus{Capacity: 100, Values: []string{"foo", "bar"}}
+			}),
+			expected: wantDefaultAnd(func(e *expected) {
+				e.alphaListSpec = make(map[string]ListStatus)
+				e.alphaListSpec["players"] = ListStatus{Capacity: 100, Values: []string{"foo", "bar"}}
+			}),
 		},
 		"defaults on passthrough": {
-			gameServer: GameServer{
-				Spec: GameServerSpec{
-					Ports: []GameServerPort{{PortPolicy: Passthrough}},
-					Template: corev1.PodTemplateSpec{
-						Spec: corev1.PodSpec{Containers: []corev1.Container{
-							{Name: "testing", Image: "testing/image"},
-						}}}},
-			},
-			container: "testing",
-			expected: expected{
-				protocol:   "UDP",
-				state:      GameServerStatePortAllocation,
-				policy:     Passthrough,
-				scheduling: apis.Packed,
-				health: Health{
-					Disabled:            false,
-					FailureThreshold:    3,
-					InitialDelaySeconds: 5,
-					PeriodSeconds:       5,
-				},
-				sdkServer: SdkServer{
-					LogLevel: SdkServerLogLevelInfo,
-					GRPCPort: 9357,
-					HTTPPort: 9358,
-				},
-			},
+			gameServer: defaultGameServerAnd(func(gss *GameServerSpec) {
+				gss.Ports[0].PortPolicy = Passthrough
+			}),
+			expected: wantDefaultAnd(func(e *expected) {
+				e.policy = Passthrough
+			}),
 		},
 		"defaults are already set": {
 			gameServer: GameServer{
@@ -234,165 +261,134 @@ func TestGameServerApplyDefaults(t *testing.T) {
 					},
 				},
 				Status: GameServerStatus{State: "TestState"}},
-			container: "testing2",
-			expected: expected{
-				protocol:   "TCP",
-				state:      "TestState",
-				policy:     Static,
-				scheduling: apis.Packed,
-				health: Health{
+			expected: wantDefaultAnd(func(e *expected) {
+				e.container = "testing2"
+				e.protocol = "TCP"
+				e.state = "TestState"
+				e.health = Health{
 					Disabled:            false,
 					FailureThreshold:    10,
 					InitialDelaySeconds: 11,
 					PeriodSeconds:       12,
-				},
-				sdkServer: SdkServer{
-					LogLevel: SdkServerLogLevelInfo,
-					GRPCPort: 9357,
-					HTTPPort: 9358,
-				},
-			},
+				}
+			}),
 		},
 		"set basic defaults on static gameserver": {
-			gameServer: GameServer{
-				Spec: GameServerSpec{
-					Ports: []GameServerPort{{PortPolicy: Static}},
-					Template: corev1.PodTemplateSpec{
-						Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "testing", Image: "testing/image"}}}}},
-			},
-			container: "testing",
-			expected: expected{
-				protocol:   "UDP",
-				state:      GameServerStateCreating,
-				policy:     Static,
-				scheduling: apis.Packed,
-				health: Health{
-					Disabled:            false,
-					FailureThreshold:    3,
-					InitialDelaySeconds: 5,
-					PeriodSeconds:       5,
-				},
-				sdkServer: SdkServer{
-					LogLevel: SdkServerLogLevelInfo,
-					GRPCPort: 9357,
-					HTTPPort: 9358,
-				},
-			},
+			gameServer: defaultGameServerAnd(func(gss *GameServerSpec) {
+				gss.Ports[0].PortPolicy = Static
+			}),
+			expected: wantDefaultAnd(func(e *expected) {
+				e.state = GameServerStateCreating
+				e.policy = Static
+			}),
 		},
 		"health is disabled": {
-			gameServer: GameServer{
-				Spec: GameServerSpec{
-					Ports:  []GameServerPort{{ContainerPort: 999}},
-					Health: Health{Disabled: true},
-					Template: corev1.PodTemplateSpec{
-						Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "testing", Image: "testing/image"}}}}},
-			},
-			container: "testing",
-			expected: expected{
-				protocol:   "UDP",
-				state:      GameServerStatePortAllocation,
-				policy:     Dynamic,
-				scheduling: apis.Packed,
-				health: Health{
-					Disabled: true,
-				},
-				sdkServer: SdkServer{
-					LogLevel: SdkServerLogLevelInfo,
-					GRPCPort: 9357,
-					HTTPPort: 9358,
-				},
-			},
+			gameServer: defaultGameServerAnd(func(gss *GameServerSpec) {
+				gss.Health = Health{Disabled: true}
+			}),
+			expected: wantDefaultAnd(func(e *expected) {
+				e.health = Health{Disabled: true}
+			}),
 		},
 		"convert from legacy single port to multiple": {
-			gameServer: GameServer{
-				Spec: GameServerSpec{
-					Ports: []GameServerPort{
-						{
-							ContainerPort: 777,
-							HostPort:      777,
-							PortPolicy:    Static,
-							Protocol:      corev1.ProtocolTCP,
-						},
-					},
-					Health: Health{Disabled: true},
-					Template: corev1.PodTemplateSpec{
-						Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "testing", Image: "testing/image"}}}}},
-			},
-			container: "testing",
-			expected: expected{
-				protocol:   corev1.ProtocolTCP,
-				state:      GameServerStateCreating,
-				policy:     Static,
-				scheduling: apis.Packed,
-				health:     Health{Disabled: true},
-				sdkServer: SdkServer{
-					LogLevel: SdkServerLogLevelInfo,
-					GRPCPort: 9357,
-					HTTPPort: 9358,
-				},
-			},
+			gameServer: defaultGameServerAnd(func(gss *GameServerSpec) {
+				gss.Ports[0] = GameServerPort{
+					ContainerPort: 777,
+					HostPort:      777,
+					PortPolicy:    Static,
+					Protocol:      corev1.ProtocolTCP,
+				}
+			}),
+			expected: wantDefaultAnd(func(e *expected) {
+				e.protocol = "TCP"
+				e.state = GameServerStateCreating
+			}),
 		},
 		"set Debug logging level": {
-			gameServer: GameServer{
-				Spec: GameServerSpec{
-					Ports:     []GameServerPort{{ContainerPort: 999}},
-					SdkServer: SdkServer{LogLevel: SdkServerLogLevelDebug},
-					Template: corev1.PodTemplateSpec{
-						Spec: corev1.PodSpec{Containers: []corev1.Container{
-							{Name: "testing", Image: "testing/image"},
-						}}}},
-			},
-			container: "testing",
-			expected: expected{
-				protocol:   "UDP",
-				state:      GameServerStatePortAllocation,
-				policy:     Dynamic,
-				scheduling: apis.Packed,
-				health: Health{
-					Disabled:            false,
-					FailureThreshold:    3,
-					InitialDelaySeconds: 5,
-					PeriodSeconds:       5,
-				},
-				sdkServer: SdkServer{
-					LogLevel: SdkServerLogLevelDebug,
-					GRPCPort: 9357,
-					HTTPPort: 9358,
-				},
-			},
+			gameServer: defaultGameServerAnd(func(gss *GameServerSpec) {
+				gss.SdkServer = SdkServer{LogLevel: SdkServerLogLevelDebug}
+			}),
+			expected: wantDefaultAnd(func(e *expected) {
+				e.sdkServer.LogLevel = SdkServerLogLevelDebug
+			}),
 		},
 		"set gRPC and HTTP ports on SDK Server": {
-			gameServer: GameServer{
-				Spec: GameServerSpec{
-					Ports: []GameServerPort{{ContainerPort: 999}},
-					SdkServer: SdkServer{
-						LogLevel: SdkServerLogLevelError,
-						GRPCPort: 19357,
-						HTTPPort: 19358,
-					},
-					Template: corev1.PodTemplateSpec{
-						Spec: corev1.PodSpec{Containers: []corev1.Container{
-							{Name: "testing", Image: "testing/image"},
-						}}}},
-			},
-			container: "testing",
-			expected: expected{
-				protocol:   "UDP",
-				state:      GameServerStatePortAllocation,
-				policy:     Dynamic,
-				scheduling: apis.Packed,
-				health: Health{
-					Disabled:            false,
-					FailureThreshold:    3,
-					InitialDelaySeconds: 5,
-					PeriodSeconds:       5,
-				},
-				sdkServer: SdkServer{
+			gameServer: defaultGameServerAnd(func(gss *GameServerSpec) {
+				gss.SdkServer = SdkServer{
 					LogLevel: SdkServerLogLevelError,
 					GRPCPort: 19357,
 					HTTPPort: 19358,
-				},
-			},
+				}
+			}),
+			expected: wantDefaultAnd(func(e *expected) {
+				e.sdkServer = SdkServer{
+					LogLevel: SdkServerLogLevelError,
+					GRPCPort: 19357,
+					HTTPPort: 19358,
+				}
+			}),
+		},
+		"defaults are eviction.safe: Never": {
+			gameServer: defaultGameServerAnd(func(gss *GameServerSpec) {}),
+			expected: wantDefaultAnd(func(e *expected) {
+				e.evictionSafeSpec = EvictionSafeNever
+				e.evictionSafeStatus = EvictionSafeNever
+			}),
+		},
+		"eviction.safe: Always": {
+			gameServer: defaultGameServerAnd(func(gss *GameServerSpec) {
+				gss.Eviction = &Eviction{Safe: EvictionSafeAlways}
+			}),
+			expected: wantDefaultAnd(func(e *expected) {
+				e.evictionSafeSpec = EvictionSafeAlways
+				e.evictionSafeStatus = EvictionSafeAlways
+			}),
+		},
+		"eviction.safe: OnUpgrade": {
+			gameServer: defaultGameServerAnd(func(gss *GameServerSpec) {
+				gss.Eviction = &Eviction{Safe: EvictionSafeOnUpgrade}
+			}),
+			expected: wantDefaultAnd(func(e *expected) {
+				e.evictionSafeSpec = EvictionSafeOnUpgrade
+				e.evictionSafeStatus = EvictionSafeOnUpgrade
+			}),
+		},
+		"eviction.safe: Never": {
+			gameServer: defaultGameServerAnd(func(gss *GameServerSpec) {
+				gss.Eviction = &Eviction{Safe: EvictionSafeNever}
+			}),
+			expected: wantDefaultAnd(func(e *expected) {
+				e.evictionSafeSpec = EvictionSafeNever
+				e.evictionSafeStatus = EvictionSafeNever
+			}),
+		},
+		"eviction.safe: Always inferred from safe-to-evict=true": {
+			gameServer: defaultGameServerAnd(func(gss *GameServerSpec) {
+				gss.Template.ObjectMeta.Annotations = map[string]string{PodSafeToEvictAnnotation: "true"}
+			}),
+			expected: wantDefaultAnd(func(e *expected) {
+				e.evictionSafeSpec = EvictionSafeNever
+				e.evictionSafeStatus = EvictionSafeAlways
+			}),
+		},
+		"Nothing inferred from safe-to-evict=false": {
+			gameServer: defaultGameServerAnd(func(gss *GameServerSpec) {
+				gss.Template.ObjectMeta.Annotations = map[string]string{PodSafeToEvictAnnotation: "false"}
+			}),
+			expected: wantDefaultAnd(func(e *expected) {
+				e.evictionSafeSpec = EvictionSafeNever
+				e.evictionSafeStatus = EvictionSafeNever
+			}),
+		},
+		"safe-to-evict=false AND eviction.safe: Always => eviction.safe: Always": {
+			gameServer: defaultGameServerAnd(func(gss *GameServerSpec) {
+				gss.Eviction = &Eviction{Safe: EvictionSafeAlways}
+				gss.Template.ObjectMeta.Annotations = map[string]string{PodSafeToEvictAnnotation: "false"}
+			}),
+			expected: wantDefaultAnd(func(e *expected) {
+				e.evictionSafeSpec = EvictionSafeAlways
+				e.evictionSafeStatus = EvictionSafeAlways
+			}),
 		},
 	}
 
@@ -410,7 +406,7 @@ func TestGameServerApplyDefaults(t *testing.T) {
 
 			spec := test.gameServer.Spec
 			assert.Contains(t, test.gameServer.ObjectMeta.Finalizers, agones.GroupName)
-			assert.Equal(t, test.container, spec.Container)
+			assert.Equal(t, test.expected.container, spec.Container)
 			assert.Equal(t, test.expected.protocol, spec.Ports[0].Protocol)
 			assert.Equal(t, test.expected.state, test.gameServer.Status.State)
 			assert.Equal(t, test.expected.scheduling, test.gameServer.Spec.Scheduling)
@@ -421,6 +417,28 @@ func TestGameServerApplyDefaults(t *testing.T) {
 			} else {
 				assert.Nil(t, test.gameServer.Spec.Players)
 				assert.Nil(t, test.gameServer.Status.Players)
+			}
+			if len(test.expected.evictionSafeSpec) > 0 {
+				assert.Equal(t, test.expected.evictionSafeSpec, spec.Eviction.Safe)
+			} else {
+				assert.Nil(t, spec.Eviction)
+			}
+			if len(test.expected.evictionSafeStatus) > 0 {
+				assert.Equal(t, test.expected.evictionSafeStatus, test.gameServer.Status.Eviction.Safe)
+			} else {
+				assert.Nil(t, test.gameServer.Status.Eviction)
+			}
+			if test.expected.alphaCounterSpec != nil {
+				assert.Equal(t, test.expected.alphaCounterSpec, test.gameServer.Status.Counters)
+			} else {
+				assert.Nil(t, test.gameServer.Spec.Counters)
+				assert.Nil(t, test.gameServer.Status.Counters)
+			}
+			if test.expected.alphaListSpec != nil {
+				assert.Equal(t, test.expected.alphaListSpec, test.gameServer.Status.Lists)
+			} else {
+				assert.Nil(t, test.gameServer.Spec.Lists)
+				assert.Nil(t, test.gameServer.Status.Lists)
 			}
 		})
 	}
@@ -433,11 +451,10 @@ func TestGameServerValidate(t *testing.T) {
 	longNameLen64 := strings.Repeat("f", validation.LabelValueMaxLength+1)
 
 	var testCases = []struct {
-		description    string
-		gs             GameServer
-		applyDefaults  bool
-		isValid        bool
-		causesExpected []metav1.StatusCause
+		description   string
+		gs            GameServer
+		applyDefaults bool
+		want          field.ErrorList
 	}{
 		{
 			description: "Valid game server",
@@ -447,7 +464,6 @@ func TestGameServerValidate(t *testing.T) {
 						Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "testing", Image: "testing/image"}}}}},
 			},
 			applyDefaults: true,
-			isValid:       true,
 		},
 		{
 			description: "Invalid gs: container, containerPort, hostPort",
@@ -471,12 +487,11 @@ func TestGameServerValidate(t *testing.T) {
 						}}}},
 			},
 			applyDefaults: false,
-			isValid:       false,
-			causesExpected: []metav1.StatusCause{
-				{Type: metav1.CauseTypeFieldValueInvalid, Message: "Container is required when using multiple containers in the pod template", Field: "container"},
-				{Type: metav1.CauseTypeFieldValueInvalid, Message: "Could not find a container named ", Field: "container"},
-				{Type: metav1.CauseTypeFieldValueInvalid, Message: "ContainerPort must be defined for Dynamic and Static PortPolicies", Field: "main.containerPort"},
-				{Type: metav1.CauseTypeFieldValueInvalid, Message: "HostPort cannot be specified with a Dynamic or Passthrough PortPolicy", Field: "main.hostPort"},
+			want: field.ErrorList{
+				field.Required(field.NewPath("spec", "container"), "Container is required when using multiple containers in the pod template"),
+				field.Invalid(field.NewPath("spec", "container"), "", "Could not find a container named "),
+				field.Required(field.NewPath("spec", "ports").Index(0).Child("containerPort"), "ContainerPort must be defined for Dynamic and Static PortPolicies"),
+				field.Forbidden(field.NewPath("spec", "ports").Index(0).Child("hostPort"), "HostPort cannot be specified with a Dynamic or Passthrough PortPolicy"),
 			},
 		},
 		{
@@ -492,10 +507,9 @@ func TestGameServerValidate(t *testing.T) {
 				},
 			},
 			applyDefaults: false,
-			isValid:       false,
-			causesExpected: []metav1.StatusCause{
-				{Type: metav1.CauseTypeFieldValueInvalid, Message: "Value 'invalid-ip' of annotation 'agones.dev/dev-address' must be a valid IP address", Field: "annotations.agones.dev/dev-address"},
-				{Type: metav1.CauseTypeFieldValueRequired, Message: "HostPort is required if GameServer is annotated with 'agones.dev/dev-address'", Field: "main.hostPort"},
+			want: field.ErrorList{
+				field.Invalid(field.NewPath("metadata").Child("annotations", "agones.dev/dev-address"), "invalid-ip", "must be a valid IP address"),
+				field.Required(field.NewPath("spec").Child("ports").Index(0).Child("hostPort"), "agones.dev/dev-address"),
 			},
 		},
 		{
@@ -519,11 +533,8 @@ func TestGameServerValidate(t *testing.T) {
 				},
 			},
 			applyDefaults: false,
-			isValid:       false,
-			causesExpected: []metav1.StatusCause{
-				{
-					Type: metav1.CauseTypeFieldValueInvalid, Message: fmt.Sprintf("Length of test-kind '%s' name should be no more than 63 characters.", longNameLen64), Field: "Name",
-				},
+			want: field.ErrorList{
+				field.TooLongMaxLength(field.NewPath("metadata", "name"), longNameLen64, 63),
 			},
 		},
 		{
@@ -546,9 +557,7 @@ func TestGameServerValidate(t *testing.T) {
 					},
 				},
 			},
-			applyDefaults:  false,
-			isValid:        true,
-			causesExpected: []metav1.StatusCause{},
+			applyDefaults: false,
 		},
 		{
 			description: "Long label key is invalid",
@@ -574,12 +583,8 @@ func TestGameServerValidate(t *testing.T) {
 				},
 			},
 			applyDefaults: false,
-			isValid:       false,
-			causesExpected: []metav1.StatusCause{
-				{
-					// error message is coming from k8s.io/apimachinery/pkg/apis/meta/v1/validation
-					Type: metav1.CauseTypeFieldValueInvalid, Message: fmt.Sprintf("labels: Invalid value: %q: name part must be no more than 63 characters", longNameLen64), Field: "labels",
-				},
+			want: field.ErrorList{
+				field.Invalid(field.NewPath("spec", "template", "metadata", "labels"), longNameLen64, "name part must be no more than 63 characters"),
 			},
 		},
 		{
@@ -606,12 +611,8 @@ func TestGameServerValidate(t *testing.T) {
 				},
 			},
 			applyDefaults: false,
-			isValid:       false,
-			causesExpected: []metav1.StatusCause{
-				{
-					// error message is coming from k8s.io/apimachinery/pkg/apis/meta/v1/validation
-					Type: metav1.CauseTypeFieldValueInvalid, Message: fmt.Sprintf("labels: Invalid value: %q: must be no more than 63 characters", longNameLen64), Field: "labels",
-				},
+			want: field.ErrorList{
+				field.Invalid(field.NewPath("spec", "template", "metadata", "labels"), longNameLen64, "must be no more than 63 characters"),
 			},
 		},
 		{
@@ -638,12 +639,8 @@ func TestGameServerValidate(t *testing.T) {
 				},
 			},
 			applyDefaults: false,
-			isValid:       false,
-			causesExpected: []metav1.StatusCause{
-				{
-					// error message is coming from k8s.io/apimachinery/pkg/apis/meta/v1/validation
-					Type: metav1.CauseTypeFieldValueInvalid, Message: fmt.Sprintf("annotations: Invalid value: %q: name part must be no more than 63 characters", longNameLen64), Field: "annotations",
-				},
+			want: field.ErrorList{
+				field.Invalid(field.NewPath("spec", "template", "metadata", "annotations"), longNameLen64, "name part must be no more than 63 characters"),
 			},
 		},
 		{
@@ -670,12 +667,8 @@ func TestGameServerValidate(t *testing.T) {
 				},
 			},
 			applyDefaults: false,
-			isValid:       false,
-			causesExpected: []metav1.StatusCause{
-				{
-					// error message is coming from k8s.io/apimachinery/pkg/apis/meta/v1/validation
-					Type: metav1.CauseTypeFieldValueInvalid, Message: fmt.Sprintf("annotations: Invalid value: %q: name part must consist of alphanumeric characters, '-', '_' or '.', and must start and end with an alphanumeric character (e.g. 'MyName',  or 'my.name',  or '123-abc', regex used for validation is '([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9]')", "agones.dev/short±Name"), Field: "annotations",
-				},
+			want: field.ErrorList{
+				field.Invalid(field.NewPath("spec", "template", "metadata", "annotations"), "agones.dev/short±Name", "name part must consist of alphanumeric characters, '-', '_' or '.', and must start and end with an alphanumeric character (e.g. 'MyName',  or 'my.name',  or '123-abc', regex used for validation is '([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9]')"),
 			},
 		},
 		{
@@ -701,9 +694,7 @@ func TestGameServerValidate(t *testing.T) {
 					},
 				},
 			},
-			applyDefaults:  false,
-			isValid:        true,
-			causesExpected: []metav1.StatusCause{},
+			applyDefaults: false,
 		},
 		{
 			description: "Check ContainerPort and HostPort with different policies",
@@ -731,11 +722,10 @@ func TestGameServerValidate(t *testing.T) {
 				},
 			},
 			applyDefaults: true,
-			isValid:       false,
-			causesExpected: []metav1.StatusCause{
-				{Type: metav1.CauseTypeFieldValueInvalid, Message: "ContainerPort cannot be specified with Passthrough PortPolicy", Field: "one.containerPort"},
-				{Type: metav1.CauseTypeFieldValueInvalid, Message: "HostPort cannot be specified with a Dynamic or Passthrough PortPolicy", Field: "two.hostPort"},
-				{Type: metav1.CauseTypeFieldValueInvalid, Message: "HostPort cannot be specified with a Dynamic or Passthrough PortPolicy", Field: "three.hostPort"},
+			want: field.ErrorList{
+				field.Required(field.NewPath("spec", "ports").Index(0).Child("containerPort"), "ContainerPort cannot be specified with Passthrough PortPolicy"),
+				field.Forbidden(field.NewPath("spec", "ports").Index(1).Child("hostPort"), "HostPort cannot be specified with a Dynamic or Passthrough PortPolicy"),
+				field.Forbidden(field.NewPath("spec", "ports").Index(2).Child("hostPort"), "HostPort cannot be specified with a Dynamic or Passthrough PortPolicy"),
 			},
 		},
 		{
@@ -761,9 +751,10 @@ func TestGameServerValidate(t *testing.T) {
 				},
 			},
 			applyDefaults: true,
-			isValid:       false,
-			causesExpected: []metav1.StatusCause{
-				{Type: metav1.CauseTypeFieldValueRequired, Message: "PortPolicy must be Static", Field: "main.portPolicy"},
+			want: field.ErrorList{
+				field.Required(
+					field.NewPath("spec", "ports").Index(0).Child("portPolicy"),
+					"PortPolicy must be Static"),
 			},
 		},
 		{
@@ -785,9 +776,11 @@ func TestGameServerValidate(t *testing.T) {
 				},
 			},
 			applyDefaults: false,
-			isValid:       false,
-			causesExpected: []metav1.StatusCause{
-				{Type: metav1.CauseTypeFieldValueInvalid, Message: "ContainerPort must be defined for Dynamic and Static PortPolicies", Field: "main.containerPort"},
+			want: field.ErrorList{
+				field.Required(
+					field.NewPath("spec", "ports").Index(0).Child("containerPort"),
+					"ContainerPort must be defined for Dynamic and Static PortPolicies",
+				),
 			},
 		},
 		{
@@ -823,9 +816,12 @@ func TestGameServerValidate(t *testing.T) {
 				},
 			},
 			applyDefaults: false,
-			isValid:       false,
-			causesExpected: []metav1.StatusCause{
-				{Type: metav1.CauseTypeFieldValueInvalid, Message: "Request must be less than or equal to cpu limit", Field: "container"},
+			want: field.ErrorList{
+				field.Invalid(
+					field.NewPath("spec", "template", "spec", "containers").Index(0).Child("resources", "requests"),
+					"50m",
+					"must be less than or equal to cpu limit of 30m",
+				),
 			},
 		},
 		{
@@ -861,9 +857,12 @@ func TestGameServerValidate(t *testing.T) {
 				},
 			},
 			applyDefaults: false,
-			isValid:       false,
-			causesExpected: []metav1.StatusCause{
-				{Type: metav1.CauseTypeFieldValueInvalid, Message: "Resource cpu request value must be non negative", Field: "container"},
+			want: field.ErrorList{
+				field.Invalid(
+					field.NewPath("spec", "template", "spec", "containers").Index(0).Child("resources", "requests").Key("cpu"),
+					"-30m",
+					"must be greater than or equal to 0",
+				),
 			},
 		},
 		{
@@ -899,10 +898,17 @@ func TestGameServerValidate(t *testing.T) {
 				},
 			},
 			applyDefaults: false,
-			isValid:       false,
-			causesExpected: []metav1.StatusCause{
-				{Type: metav1.CauseTypeFieldValueInvalid, Message: "Request must be less than or equal to cpu limit", Field: "container"},
-				{Type: metav1.CauseTypeFieldValueInvalid, Message: "Resource cpu limit value must be non negative", Field: "container"},
+			want: field.ErrorList{
+				field.Invalid(
+					field.NewPath("spec", "template", "spec", "containers").Index(0).Child("resources", "limits").Key("cpu"),
+					"-30m",
+					"must be greater than or equal to 0",
+				),
+				field.Invalid(
+					field.NewPath("spec", "template", "spec", "containers").Index(0).Child("resources", "requests"),
+					"30m",
+					"must be less than or equal to cpu limit of -30m",
+				),
 			},
 		},
 		{
@@ -938,9 +944,12 @@ func TestGameServerValidate(t *testing.T) {
 				},
 			},
 			applyDefaults: false,
-			isValid:       false,
-			causesExpected: []metav1.StatusCause{
-				{Type: metav1.CauseTypeFieldValueInvalid, Message: "Request must be less than or equal to memory limit", Field: "container"},
+			want: field.ErrorList{
+				field.Invalid(
+					field.NewPath("spec", "template", "spec", "containers").Index(0).Child("resources", "requests"),
+					"55Mi",
+					"must be less than or equal to memory limit of 32Mi",
+				),
 			},
 		},
 		{
@@ -976,9 +985,12 @@ func TestGameServerValidate(t *testing.T) {
 				},
 			},
 			applyDefaults: false,
-			isValid:       false,
-			causesExpected: []metav1.StatusCause{
-				{Type: metav1.CauseTypeFieldValueInvalid, Message: "Resource memory request value must be non negative", Field: "container"},
+			want: field.ErrorList{
+				field.Invalid(
+					field.NewPath("spec", "template", "spec", "containers").Index(0).Child("resources", "requests").Key("memory"),
+					"-32Mi",
+					"must be greater than or equal to 0",
+				),
 			},
 		},
 		{
@@ -1014,10 +1026,17 @@ func TestGameServerValidate(t *testing.T) {
 				},
 			},
 			applyDefaults: false,
-			isValid:       false,
-			causesExpected: []metav1.StatusCause{
-				{Type: metav1.CauseTypeFieldValueInvalid, Message: "Request must be less than or equal to memory limit", Field: "container"},
-				{Type: metav1.CauseTypeFieldValueInvalid, Message: "Resource memory limit value must be non negative", Field: "container"},
+			want: field.ErrorList{
+				field.Invalid(
+					field.NewPath("spec", "template", "spec", "containers").Index(0).Child("resources", "limits").Key("memory"),
+					"-32Mi",
+					"must be greater than or equal to 0",
+				),
+				field.Invalid(
+					field.NewPath("spec", "template", "spec", "containers").Index(0).Child("resources", "requests"),
+					"32Mi",
+					"must be less than or equal to memory limit of -32Mi",
+				),
 			},
 		},
 	}
@@ -1028,10 +1047,8 @@ func TestGameServerValidate(t *testing.T) {
 				tc.gs.ApplyDefaults()
 			}
 
-			causes, ok := tc.gs.Validate()
-
-			assert.Equal(t, tc.isValid, ok)
-			assert.ElementsMatch(t, tc.causesExpected, causes, "causes check")
+			errs := tc.gs.Validate(fakeAPIHooks{})
+			assert.ElementsMatch(t, tc.want, errs, "ErrorList check")
 		})
 	}
 }
@@ -1044,11 +1061,10 @@ func TestGameServerValidateFeatures(t *testing.T) {
 	portContainerName := "another-container"
 
 	var testCases = []struct {
-		description    string
-		feature        string
-		gs             GameServer
-		isValid        bool
-		causesExpected []metav1.StatusCause
+		description string
+		feature     string
+		gs          GameServer
+		want        field.ErrorList
 	}{
 		{
 			description: "Invalid container name, container was not found",
@@ -1073,9 +1089,12 @@ func TestGameServerValidateFeatures(t *testing.T) {
 						}}},
 				},
 			},
-			isValid: false,
-			causesExpected: []metav1.StatusCause{
-				{Type: metav1.CauseTypeFieldValueInvalid, Message: "Container must be empty or the name of a container in the pod template", Field: "main.container"},
+			want: field.ErrorList{
+				field.Invalid(
+					field.NewPath("spec", "ports").Index(0).Child("container"),
+					"another-container",
+					"Container must be empty or the name of a container in the pod template",
+				),
 			},
 		},
 		{
@@ -1100,8 +1119,6 @@ func TestGameServerValidateFeatures(t *testing.T) {
 						}}},
 				},
 			},
-			isValid:        true,
-			causesExpected: []metav1.StatusCause{},
 		},
 		{
 			description: "PlayerTracking is disabled, Players field specified",
@@ -1113,9 +1130,11 @@ func TestGameServerValidateFeatures(t *testing.T) {
 					Template: corev1.PodTemplateSpec{
 						Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "testing", Image: "testing/image"}}}}},
 			},
-			isValid: false,
-			causesExpected: []metav1.StatusCause{
-				{Type: metav1.CauseTypeFieldValueNotSupported, Message: "Value cannot be set unless feature flag PlayerTracking is enabled", Field: "players"},
+			want: field.ErrorList{
+				field.Forbidden(
+					field.NewPath("spec", "players"),
+					"Value cannot be set unless feature flag PlayerTracking is enabled",
+				),
 			},
 		},
 		{
@@ -1128,8 +1147,62 @@ func TestGameServerValidateFeatures(t *testing.T) {
 					Template: corev1.PodTemplateSpec{
 						Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "testing", Image: "testing/image"}}}}},
 			},
-			isValid:        true,
-			causesExpected: []metav1.StatusCause{},
+		},
+		{
+			description: "CountsAndLists is disabled, Counters field specified",
+			feature:     fmt.Sprintf("%s=false", runtime.FeatureCountsAndLists),
+			gs: GameServer{
+				Spec: GameServerSpec{
+					Container: "testing",
+					Counters:  map[string]CounterStatus{},
+					Template: corev1.PodTemplateSpec{
+						Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "testing", Image: "testing/image"}}}}},
+			},
+			want: field.ErrorList{
+				field.Forbidden(
+					field.NewPath("spec", "counters"),
+					"Value cannot be set unless feature flag CountsAndLists is enabled",
+				),
+			},
+		},
+		{
+			description: "CountsAndLists is disabled, Lists field specified",
+			feature:     fmt.Sprintf("%s=false", runtime.FeatureCountsAndLists),
+			gs: GameServer{
+				Spec: GameServerSpec{
+					Container: "testing",
+					Lists:     map[string]ListStatus{},
+					Template: corev1.PodTemplateSpec{
+						Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "testing", Image: "testing/image"}}}}},
+			},
+			want: field.ErrorList{
+				field.Forbidden(
+					field.NewPath("spec", "lists"),
+					"Value cannot be set unless feature flag CountsAndLists is enabled",
+				),
+			},
+		},
+		{
+			description: "CountsAndLists is enabled, Counters field specified",
+			feature:     fmt.Sprintf("%s=true", runtime.FeatureCountsAndLists),
+			gs: GameServer{
+				Spec: GameServerSpec{
+					Container: "testing",
+					Counters:  map[string]CounterStatus{},
+					Template: corev1.PodTemplateSpec{
+						Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "testing", Image: "testing/image"}}}}},
+			},
+		},
+		{
+			description: "CountsAndLists is enabled, Lists field specified",
+			feature:     fmt.Sprintf("%s=true", runtime.FeatureCountsAndLists),
+			gs: GameServer{
+				Spec: GameServerSpec{
+					Container: "testing",
+					Lists:     map[string]ListStatus{},
+					Template: corev1.PodTemplateSpec{
+						Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "testing", Image: "testing/image"}}}}},
+			},
 		},
 	}
 
@@ -1138,10 +1211,8 @@ func TestGameServerValidateFeatures(t *testing.T) {
 			err := runtime.ParseFeatures(tc.feature)
 			assert.NoError(t, err)
 
-			causes, ok := tc.gs.Validate()
-
-			assert.Equal(t, tc.isValid, ok)
-			assert.ElementsMatch(t, tc.causesExpected, causes, "causes check")
+			errs := tc.gs.Validate(fakeAPIHooks{})
+			assert.ElementsMatch(t, tc.want, errs, "ErrorList check")
 		})
 	}
 }
@@ -1151,9 +1222,10 @@ func TestGameServerPodNoErrors(t *testing.T) {
 	fixture := defaultGameServer()
 	fixture.ApplyDefaults()
 
-	pod, err := fixture.Pod()
+	pod, err := fixture.Pod(fakeAPIHooks{})
 	assert.Nil(t, err, "Pod should not return an error")
 	assert.Equal(t, fixture.ObjectMeta.Name, pod.ObjectMeta.Name)
+	assert.Equal(t, fixture.ObjectMeta.Name, pod.Spec.Hostname)
 	assert.Equal(t, fixture.ObjectMeta.Namespace, pod.ObjectMeta.Namespace)
 	assert.Equal(t, "gameserver", pod.ObjectMeta.Labels[agones.GroupName+"/role"])
 	assert.Equal(t, fixture.ObjectMeta.Name, pod.ObjectMeta.Labels[GameServerPodLabel])
@@ -1163,6 +1235,25 @@ func TestGameServerPodNoErrors(t *testing.T) {
 	assert.Equal(t, fixture.Spec.Ports[0].ContainerPort, pod.Spec.Containers[0].Ports[0].ContainerPort)
 	assert.Equal(t, corev1.Protocol("UDP"), pod.Spec.Containers[0].Ports[0].Protocol)
 	assert.True(t, metav1.IsControlledBy(pod, fixture))
+}
+
+func TestGameServerPodHostName(t *testing.T) {
+	t.Parallel()
+
+	fixture := defaultGameServer()
+	fixture.ObjectMeta.Name = "test-1.0"
+	fixture.ApplyDefaults()
+	pod, err := fixture.Pod(fakeAPIHooks{})
+	require.NoError(t, err)
+	assert.Equal(t, "test-1-0", pod.Spec.Hostname)
+
+	fixture = defaultGameServer()
+	fixture.ApplyDefaults()
+	expected := "ORANGE"
+	fixture.Spec.Template.Spec.Hostname = expected
+	pod, err = fixture.Pod(fakeAPIHooks{})
+	require.NoError(t, err)
+	assert.Equal(t, expected, pod.Spec.Hostname)
 }
 
 func TestGameServerPodContainerNotFoundErrReturned(t *testing.T) {
@@ -1187,7 +1278,7 @@ func TestGameServerPodContainerNotFoundErrReturned(t *testing.T) {
 			},
 		}, Status: GameServerStatus{State: GameServerStateCreating}}
 
-	_, err := fixture.Pod()
+	_, err := fixture.Pod(fakeAPIHooks{})
 	if assert.NotNil(t, err, "Pod should return an error") {
 		assert.Equal(t, "failed to find container named Container1 in pod spec", err.Error())
 	}
@@ -1200,7 +1291,7 @@ func TestGameServerPodWithSidecarNoErrors(t *testing.T) {
 
 	sidecar := corev1.Container{Name: "sidecar", Image: "container/sidecar"}
 	fixture.Spec.Template.Spec.ServiceAccountName = "other-agones-sdk"
-	pod, err := fixture.Pod(sidecar)
+	pod, err := fixture.Pod(fakeAPIHooks{}, sidecar)
 	assert.Nil(t, err, "Pod should not return an error")
 	assert.Equal(t, fixture.ObjectMeta.Name, pod.ObjectMeta.Name)
 	assert.Len(t, pod.Spec.Containers, 2, "Should have two containers")
@@ -1225,7 +1316,7 @@ func TestGameServerPodWithMultiplePortAllocations(t *testing.T) {
 	fixture.Spec.Container = fixture.Spec.Template.Spec.Containers[0].Name
 	fixture.ApplyDefaults()
 
-	pod, err := fixture.Pod()
+	pod, err := fixture.Pod(fakeAPIHooks{})
 	assert.NoError(t, err, "Pod should not return an error")
 	assert.Equal(t, fixture.ObjectMeta.Name, pod.ObjectMeta.Name)
 	assert.Equal(t, fixture.ObjectMeta.Namespace, pod.ObjectMeta.Namespace)
@@ -1247,93 +1338,32 @@ func TestGameServerPodObjectMeta(t *testing.T) {
 	fixture := &GameServer{ObjectMeta: metav1.ObjectMeta{Name: "lucy"},
 		Spec: GameServerSpec{Container: "goat"}}
 
-	f := func(t *testing.T, gs *GameServer, pod *corev1.Pod) {
-		assert.Equal(t, gs.ObjectMeta.Name, pod.ObjectMeta.Name)
-		assert.Equal(t, gs.ObjectMeta.Namespace, pod.ObjectMeta.Namespace)
-		assert.Equal(t, GameServerLabelRole, pod.ObjectMeta.Labels[RoleLabel])
-		assert.Equal(t, "gameserver", pod.ObjectMeta.Labels[agones.GroupName+"/role"])
-		assert.Equal(t, gs.ObjectMeta.Name, pod.ObjectMeta.Labels[GameServerPodLabel])
-		assert.Equal(t, "goat", pod.ObjectMeta.Annotations[GameServerContainerAnnotation])
-		assert.True(t, metav1.IsControlledBy(pod, gs))
-	}
-
-	t.Run("packed", func(t *testing.T) {
-		gs := fixture.DeepCopy()
-		gs.Spec.Scheduling = apis.Packed
-		pod := &corev1.Pod{}
-
-		gs.podObjectMeta(pod)
-		f(t, gs, pod)
-
-		assert.Equal(t, "false", pod.ObjectMeta.Annotations[PodSafeToEvictAnnotation])
-	})
-
-	t.Run("distributed", func(t *testing.T) {
-		gs := fixture.DeepCopy()
-		gs.Spec.Scheduling = apis.Distributed
-		pod := &corev1.Pod{}
-
-		gs.podObjectMeta(pod)
-		f(t, gs, pod)
-
-		assert.Equal(t, "", pod.ObjectMeta.Annotations[PodSafeToEvictAnnotation])
-	})
-}
-
-func TestGameServerPodAutoscalerAnnotations(t *testing.T) {
-	testCases := []struct {
-		description        string
-		scheduling         apis.SchedulingStrategy
-		setAnnotation      bool
-		expectedAnnotation string
+	for desc, tc := range map[string]struct {
+		scheduling apis.SchedulingStrategy
+		wantSafe   string
 	}{
-		{
-			description:        "Packed",
-			scheduling:         apis.Packed,
-			expectedAnnotation: "false",
+		"packed": {
+			scheduling: apis.Packed,
 		},
-		{
-			description:        "Distributed",
-			scheduling:         apis.Distributed,
-			expectedAnnotation: "",
+		"distributed": {
+			scheduling: apis.Distributed,
 		},
-		{
-			description:        "Packed with autoscaler annotation",
-			scheduling:         apis.Packed,
-			setAnnotation:      true,
-			expectedAnnotation: "true",
-		},
-		{
-			description:        "Distributed with autoscaler annotation",
-			scheduling:         apis.Distributed,
-			setAnnotation:      true,
-			expectedAnnotation: "true",
-		},
-	}
-
-	fixture := &GameServer{
-		ObjectMeta: metav1.ObjectMeta{Name: "logan"},
-		Spec:       GameServerSpec{Container: "sheep"},
-	}
-	for _, tc := range testCases {
-		t.Run(tc.description, func(t *testing.T) {
+	} {
+		t.Run(desc, func(t *testing.T) {
 			gs := fixture.DeepCopy()
 			gs.Spec.Scheduling = tc.scheduling
-			if tc.setAnnotation {
-				gs.Spec.Template = corev1.PodTemplateSpec{ObjectMeta: metav1.ObjectMeta{
-					Annotations: map[string]string{PodSafeToEvictAnnotation: "true"},
-				}}
-			}
-			pod, err := gs.Pod()
-			assert.Nil(t, err, "Pod should not return an error")
+			pod := &corev1.Pod{}
+
+			gs.podObjectMeta(pod)
+
 			assert.Equal(t, gs.ObjectMeta.Name, pod.ObjectMeta.Name)
 			assert.Equal(t, gs.ObjectMeta.Namespace, pod.ObjectMeta.Namespace)
 			assert.Equal(t, GameServerLabelRole, pod.ObjectMeta.Labels[RoleLabel])
 			assert.Equal(t, "gameserver", pod.ObjectMeta.Labels[agones.GroupName+"/role"])
 			assert.Equal(t, gs.ObjectMeta.Name, pod.ObjectMeta.Labels[GameServerPodLabel])
-			assert.Equal(t, "sheep", pod.ObjectMeta.Annotations[GameServerContainerAnnotation])
+			assert.Equal(t, "goat", pod.ObjectMeta.Annotations[GameServerContainerAnnotation])
 			assert.True(t, metav1.IsControlledBy(pod, gs))
-			assert.Equal(t, tc.expectedAnnotation, pod.ObjectMeta.Annotations[PodSafeToEvictAnnotation])
+			assert.Equal(t, tc.wantSafe, pod.ObjectMeta.Annotations[PodSafeToEvictAnnotation])
 		})
 	}
 }
@@ -1372,7 +1402,7 @@ func TestGameServerDisableServiceAccount(t *testing.T) {
 		}}}
 
 	gs.ApplyDefaults()
-	pod, err := gs.Pod()
+	pod, err := gs.Pod(fakeAPIHooks{})
 	assert.NoError(t, err)
 	assert.Len(t, pod.Spec.Containers, 1)
 	assert.Empty(t, pod.Spec.Containers[0].VolumeMounts)
@@ -1576,4 +1606,443 @@ func defaultGameServer() *GameServer {
 				},
 			},
 		}, Status: GameServerStatus{State: GameServerStateCreating}}
+}
+
+func TestGameServerUpdateCount(t *testing.T) {
+	t.Parallel()
+
+	testCases := map[string]struct {
+		gs      GameServer
+		name    string
+		action  string
+		amount  int64
+		want    CounterStatus
+		wantErr bool
+	}{
+		"counter not in game server no-op and error": {
+			gs: GameServer{Status: GameServerStatus{
+				Counters: map[string]CounterStatus{
+					"foos": {
+						Count:    0,
+						Capacity: 100,
+					}}}},
+			name:    "foo",
+			action:  "Increment",
+			amount:  1,
+			wantErr: true,
+		},
+		"negative amount no-op and error": {
+			gs: GameServer{Status: GameServerStatus{
+				Counters: map[string]CounterStatus{
+					"foos": {
+						Count:    1,
+						Capacity: 100,
+					}}}},
+			name:   "foos",
+			action: "Decrement",
+			amount: -1,
+			want: CounterStatus{
+				Count:    1,
+				Capacity: 100,
+			},
+			wantErr: true,
+		},
+		"increment by 1": {
+			gs: GameServer{Status: GameServerStatus{
+				Counters: map[string]CounterStatus{
+					"players": {
+						Count:    0,
+						Capacity: 100,
+					}}}},
+			name:   "players",
+			action: "Increment",
+			amount: 1,
+			want: CounterStatus{
+				Count:    1,
+				Capacity: 100,
+			},
+			wantErr: false,
+		},
+		"decrement by 10": {
+			gs: GameServer{Status: GameServerStatus{
+				Counters: map[string]CounterStatus{
+					"bars": {
+						Count:    99,
+						Capacity: 100,
+					}}}},
+			name:   "bars",
+			action: "Decrement",
+			amount: 10,
+			want: CounterStatus{
+				Count:    89,
+				Capacity: 100,
+			},
+			wantErr: false,
+		},
+		"incorrect action no-op and error": {
+			gs: GameServer{Status: GameServerStatus{
+				Counters: map[string]CounterStatus{
+					"bazes": {
+						Count:    99,
+						Capacity: 100,
+					}}}},
+			name:   "bazes",
+			action: "decrement",
+			amount: 10,
+			want: CounterStatus{
+				Count:    99,
+				Capacity: 100,
+			},
+			wantErr: true,
+		},
+		"decrement beyond zero truncated": {
+			gs: GameServer{Status: GameServerStatus{
+				Counters: map[string]CounterStatus{
+					"baz": {
+						Count:    99,
+						Capacity: 100,
+					}}}},
+			name:   "baz",
+			action: "Decrement",
+			amount: 100,
+			want: CounterStatus{
+				Count:    0,
+				Capacity: 100,
+			},
+			wantErr: false,
+		},
+		"increment beyond capacity truncated": {
+			gs: GameServer{Status: GameServerStatus{
+				Counters: map[string]CounterStatus{
+					"splayers": {
+						Count:    99,
+						Capacity: 100,
+					}}}},
+			name:   "splayers",
+			action: "Increment",
+			amount: 2,
+			want: CounterStatus{
+				Count:    100,
+				Capacity: 100,
+			},
+			wantErr: false,
+		},
+	}
+
+	for test, testCase := range testCases {
+		t.Run(test, func(t *testing.T) {
+			err := testCase.gs.UpdateCount(testCase.name, testCase.action, testCase.amount)
+			if err != nil {
+				assert.True(t, testCase.wantErr)
+			} else {
+				assert.False(t, testCase.wantErr)
+			}
+			if counter, ok := testCase.gs.Status.Counters[testCase.name]; ok {
+				assert.Equal(t, testCase.want, counter)
+			}
+		})
+	}
+}
+
+func TestGameServerUpdateCounterCapacity(t *testing.T) {
+	t.Parallel()
+
+	testCases := map[string]struct {
+		gs       GameServer
+		name     string
+		capacity int64
+		want     CounterStatus
+		wantErr  bool
+	}{
+		"counter not in game server no-op with error": {
+			gs: GameServer{Status: GameServerStatus{
+				Counters: map[string]CounterStatus{
+					"foos": {
+						Count:    0,
+						Capacity: 100,
+					}}}},
+			name:     "foo",
+			capacity: 1000,
+			wantErr:  true,
+		},
+		"capacity less than zero no-op with error": {
+			gs: GameServer{Status: GameServerStatus{
+				Counters: map[string]CounterStatus{
+					"foos": {
+						Count:    0,
+						Capacity: 100,
+					}}}},
+			name:     "foos",
+			capacity: -1000,
+			want: CounterStatus{
+				Count:    0,
+				Capacity: 100,
+			},
+			wantErr: true,
+		},
+		"update capacity": {
+			gs: GameServer{Status: GameServerStatus{
+				Counters: map[string]CounterStatus{
+					"sessions": {
+						Count:    0,
+						Capacity: 100,
+					}}}},
+			name:     "sessions",
+			capacity: 9223372036854775807,
+			want: CounterStatus{
+				Count:    0,
+				Capacity: 9223372036854775807,
+			},
+		},
+	}
+
+	for test, testCase := range testCases {
+		t.Run(test, func(t *testing.T) {
+			err := testCase.gs.UpdateCounterCapacity(testCase.name, testCase.capacity)
+			if err != nil {
+				assert.True(t, testCase.wantErr)
+			} else {
+				assert.False(t, testCase.wantErr)
+			}
+			if counter, ok := testCase.gs.Status.Counters[testCase.name]; ok {
+				assert.Equal(t, testCase.want, counter)
+			}
+		})
+	}
+}
+
+func TestGameServerUpdateListCapacity(t *testing.T) {
+	t.Parallel()
+
+	testCases := map[string]struct {
+		gs       GameServer
+		name     string
+		capacity int64
+		want     ListStatus
+		wantErr  bool
+	}{
+		"list not in game server no-op with error": {
+			gs: GameServer{Status: GameServerStatus{
+				Lists: map[string]ListStatus{
+					"things": {
+						Values:   []string{},
+						Capacity: 100,
+					}}}},
+			name:     "thing",
+			capacity: 1000,
+			wantErr:  true,
+		},
+		"update list capacity": {
+			gs: GameServer{Status: GameServerStatus{
+				Lists: map[string]ListStatus{
+					"things": {
+						Values:   []string{},
+						Capacity: 100,
+					}}}},
+			name:     "things",
+			capacity: 1000,
+			want: ListStatus{
+				Values:   []string{},
+				Capacity: 1000,
+			},
+			wantErr: false,
+		},
+		"list capacity above max no-op with error": {
+			gs: GameServer{Status: GameServerStatus{
+				Lists: map[string]ListStatus{
+					"slings": {
+						Values:   []string{},
+						Capacity: 100,
+					}}}},
+			name:     "slings",
+			capacity: 10000,
+			want: ListStatus{
+				Values:   []string{},
+				Capacity: 100,
+			},
+			wantErr: true,
+		},
+		"list capacity less than zero no-op with error": {
+			gs: GameServer{Status: GameServerStatus{
+				Lists: map[string]ListStatus{
+					"flings": {
+						Values:   []string{},
+						Capacity: 999,
+					}}}},
+			name:     "flings",
+			capacity: -100,
+			want: ListStatus{
+				Values:   []string{},
+				Capacity: 999,
+			},
+			wantErr: true,
+		},
+	}
+
+	for test, testCase := range testCases {
+		t.Run(test, func(t *testing.T) {
+			err := testCase.gs.UpdateListCapacity(testCase.name, testCase.capacity)
+			if err != nil {
+				assert.True(t, testCase.wantErr)
+			} else {
+				assert.False(t, testCase.wantErr)
+			}
+			if list, ok := testCase.gs.Status.Lists[testCase.name]; ok {
+				assert.Equal(t, testCase.want, list)
+			}
+		})
+	}
+}
+
+func TestGameServerAppendListValues(t *testing.T) {
+	t.Parallel()
+
+	var nilSlice []string
+
+	testCases := map[string]struct {
+		gs      GameServer
+		name    string
+		values  []string
+		want    ListStatus
+		wantErr bool
+	}{
+		"list not in game server no-op with error": {
+			gs: GameServer{Status: GameServerStatus{
+				Lists: map[string]ListStatus{
+					"things": {
+						Values:   []string{},
+						Capacity: 100,
+					}}}},
+			name:    "thing",
+			values:  []string{"thing1", "thing2", "thing3"},
+			wantErr: true,
+		},
+		"append values": {
+			gs: GameServer{Status: GameServerStatus{
+				Lists: map[string]ListStatus{
+					"things": {
+						Values:   []string{"thing1"},
+						Capacity: 100,
+					}}}},
+			name:   "things",
+			values: []string{"thing2", "thing3"},
+			want: ListStatus{
+				Values:   []string{"thing1", "thing2", "thing3"},
+				Capacity: 100,
+			},
+			wantErr: false,
+		},
+		"append values with silent drop of duplicates": {
+			gs: GameServer{Status: GameServerStatus{
+				Lists: map[string]ListStatus{
+					"games": {
+						Values:   []string{"game0"},
+						Capacity: 10,
+					}}}},
+			name:   "games",
+			values: []string{"game1", "game2", "game2", "game1"},
+			want: ListStatus{
+				Values:   []string{"game0", "game1", "game2"},
+				Capacity: 10,
+			},
+			wantErr: false,
+		},
+		"append values with silent drop of duplicates in original list": {
+			gs: GameServer{Status: GameServerStatus{
+				Lists: map[string]ListStatus{
+					"objects": {
+						Values:   []string{"object1", "object2"},
+						Capacity: 10,
+					}}}},
+			name:   "objects",
+			values: []string{"object2", "object1", "object3", "object3"},
+			want: ListStatus{
+				Values:   []string{"object1", "object2", "object3"},
+				Capacity: 10,
+			},
+			wantErr: false,
+		},
+		"append nil values": {
+			gs: GameServer{Status: GameServerStatus{
+				Lists: map[string]ListStatus{
+					"blings": {
+						Values:   []string{"bling1"},
+						Capacity: 10,
+					}}}},
+			name:   "blings",
+			values: nilSlice,
+			want: ListStatus{
+				Values:   []string{"bling1"},
+				Capacity: 10,
+			},
+			wantErr: true,
+		},
+		"append too many values truncates list": {
+			gs: GameServer{Status: GameServerStatus{
+				Lists: map[string]ListStatus{
+					"bananaslugs": {
+						Values:   []string{"bananaslugs1", "bananaslug2", "bananaslug3"},
+						Capacity: 5,
+					}}}},
+			name:   "bananaslugs",
+			values: []string{"bananaslug4", "bananaslug5", "bananaslug6"},
+			want: ListStatus{
+				Values:   []string{"bananaslugs1", "bananaslug2", "bananaslug3", "bananaslug4", "bananaslug5"},
+				Capacity: 5,
+			},
+			wantErr: false,
+		},
+	}
+
+	for test, testCase := range testCases {
+		t.Run(test, func(t *testing.T) {
+			err := testCase.gs.AppendListValues(testCase.name, testCase.values)
+			if err != nil {
+				assert.True(t, testCase.wantErr)
+			} else {
+				assert.False(t, testCase.wantErr)
+			}
+			if list, ok := testCase.gs.Status.Lists[testCase.name]; ok {
+				assert.Equal(t, testCase.want, list)
+			}
+		})
+	}
+}
+
+func TestMergeRemoveDuplicates(t *testing.T) {
+	t.Parallel()
+
+	testCases := map[string]struct {
+		str1 []string
+		str2 []string
+		want []string
+	}{
+		"empty string arrays": {
+			str1: []string{},
+			str2: []string{},
+			want: []string{},
+		},
+		"no duplicates": {
+			str1: []string{"one"},
+			str2: []string{"two", "three"},
+			want: []string{"one", "two", "three"},
+		},
+		"remove one duplicate": {
+			str1: []string{"one", "one", "one"},
+			str2: []string{"one", "one", "one"},
+			want: []string{"one"},
+		},
+		"remove multiple duplicates": {
+			str1: []string{"one", "two"},
+			str2: []string{"two", "one"},
+			want: []string{"one", "two"},
+		},
+	}
+
+	for test, testCase := range testCases {
+		t.Run(test, func(t *testing.T) {
+			got := MergeRemoveDuplicates(testCase.str1, testCase.str2)
+			assert.Equal(t, testCase.want, got)
+		})
+	}
 }

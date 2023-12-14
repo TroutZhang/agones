@@ -18,6 +18,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"math/rand"
 	"net/http"
 	"strconv"
@@ -26,6 +27,7 @@ import (
 
 	"agones.dev/agones/pkg/apis"
 	agonesv1 "agones.dev/agones/pkg/apis/agones/v1"
+	"agones.dev/agones/pkg/cloudproduct/generic"
 	"agones.dev/agones/pkg/gameservers"
 	agtesting "agones.dev/agones/pkg/testing"
 	utilruntime "agones.dev/agones/pkg/util/runtime"
@@ -72,6 +74,7 @@ func TestComputeReconciliationAction(t *testing.T) {
 		wantNumServersToAdd    int
 		wantNumServersToDelete int
 		wantIsPartial          bool
+		priorities             []agonesv1.Priority
 	}{
 		{
 			desc: "Empty",
@@ -218,7 +221,7 @@ func TestComputeReconciliationAction(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.desc, func(t *testing.T) {
 			toAdd, toDelete, isPartial := computeReconciliationAction(apis.Distributed, tc.list, map[string]gameservers.NodeCount{},
-				tc.targetReplicaCount, maxTestCreationsPerBatch, maxTestDeletionsPerBatch, maxTestPendingPerBatch)
+				tc.targetReplicaCount, maxTestCreationsPerBatch, maxTestDeletionsPerBatch, maxTestPendingPerBatch, tc.priorities)
 
 			assert.Equal(t, tc.wantNumServersToAdd, toAdd, "# of GameServers to add")
 			assert.Len(t, toDelete, tc.wantNumServersToDelete, "# of GameServers to delete")
@@ -236,7 +239,7 @@ func TestComputeReconciliationAction(t *testing.T) {
 
 		counts := map[string]gameservers.NodeCount{"node1": {Ready: 1}, "node3": {Ready: 2}}
 		toAdd, toDelete, isPartial := computeReconciliationAction(apis.Packed, list, counts, 2,
-			1000, 1000, 1000)
+			1000, 1000, 1000, nil)
 
 		assert.Empty(t, toAdd)
 		assert.False(t, isPartial, "shouldn't be partial")
@@ -261,7 +264,7 @@ func TestComputeReconciliationAction(t *testing.T) {
 		}
 
 		toAdd, toDelete, isPartial := computeReconciliationAction(apis.Distributed, list, map[string]gameservers.NodeCount{},
-			2, 1000, 1000, 1000)
+			2, 1000, 1000, 1000, nil)
 
 		assert.Empty(t, toAdd)
 		assert.False(t, isPartial, "shouldn't be partial")
@@ -275,40 +278,47 @@ func TestComputeReconciliationAction(t *testing.T) {
 func TestComputeStatus(t *testing.T) {
 	t.Parallel()
 
-	cases := []struct {
-		list       []*agonesv1.GameServer
-		wantStatus agonesv1.GameServerSetStatus
-	}{
-		{[]*agonesv1.GameServer{}, agonesv1.GameServerSetStatus{}},
-		{[]*agonesv1.GameServer{
-			gsWithState(agonesv1.GameServerStateCreating),
-			gsWithState(agonesv1.GameServerStateReady),
-		}, agonesv1.GameServerSetStatus{ReadyReplicas: 1, Replicas: 2}},
-		{[]*agonesv1.GameServer{
-			gsWithState(agonesv1.GameServerStateAllocated),
-			gsWithState(agonesv1.GameServerStateAllocated),
-			gsWithState(agonesv1.GameServerStateCreating),
-			gsWithState(agonesv1.GameServerStateReady),
-		}, agonesv1.GameServerSetStatus{ReadyReplicas: 1, AllocatedReplicas: 2, Replicas: 4}},
-		{
-			list: []*agonesv1.GameServer{
-				gsWithState(agonesv1.GameServerStateReserved),
-				gsWithState(agonesv1.GameServerStateReserved),
-				gsWithState(agonesv1.GameServerStateReady),
-			},
-			wantStatus: agonesv1.GameServerSetStatus{Replicas: 3, ReadyReplicas: 1, ReservedReplicas: 2},
-		},
-	}
+	t.Run("compute status", func(t *testing.T) {
+		utilruntime.FeatureTestMutex.Lock()
+		defer utilruntime.FeatureTestMutex.Unlock()
 
-	for _, tc := range cases {
-		assert.Equal(t, tc.wantStatus, computeStatus(tc.list))
-	}
+		require.NoError(t, utilruntime.ParseFeatures(fmt.Sprintf("%s=false", utilruntime.FeatureCountsAndLists)))
+
+		cases := []struct {
+			list       []*agonesv1.GameServer
+			wantStatus agonesv1.GameServerSetStatus
+		}{
+			{[]*agonesv1.GameServer{}, agonesv1.GameServerSetStatus{}},
+			{[]*agonesv1.GameServer{
+				gsWithState(agonesv1.GameServerStateCreating),
+				gsWithState(agonesv1.GameServerStateReady),
+			}, agonesv1.GameServerSetStatus{ReadyReplicas: 1, Replicas: 2}},
+			{[]*agonesv1.GameServer{
+				gsWithState(agonesv1.GameServerStateAllocated),
+				gsWithState(agonesv1.GameServerStateAllocated),
+				gsWithState(agonesv1.GameServerStateCreating),
+				gsWithState(agonesv1.GameServerStateReady),
+			}, agonesv1.GameServerSetStatus{ReadyReplicas: 1, AllocatedReplicas: 2, Replicas: 4}},
+			{
+				list: []*agonesv1.GameServer{
+					gsWithState(agonesv1.GameServerStateReserved),
+					gsWithState(agonesv1.GameServerStateReserved),
+					gsWithState(agonesv1.GameServerStateReady),
+				},
+				wantStatus: agonesv1.GameServerSetStatus{Replicas: 3, ReadyReplicas: 1, ReservedReplicas: 2},
+			},
+		}
+
+		for _, tc := range cases {
+			assert.Equal(t, tc.wantStatus, computeStatus(tc.list))
+		}
+	})
 
 	t.Run("player tracking", func(t *testing.T) {
 		utilruntime.FeatureTestMutex.Lock()
 		defer utilruntime.FeatureTestMutex.Unlock()
 
-		require.NoError(t, utilruntime.ParseFeatures(string(utilruntime.FeaturePlayerTracking)+"=true"))
+		require.NoError(t, utilruntime.ParseFeatures(fmt.Sprintf("%s=true", utilruntime.FeaturePlayerTracking)))
 
 		var list []*agonesv1.GameServer
 		gs1 := gsWithState(agonesv1.GameServerStateAllocated)
@@ -334,10 +344,118 @@ func TestComputeStatus(t *testing.T) {
 
 		assert.Equal(t, expected, computeStatus(list))
 	})
+
+	t.Run("counters", func(t *testing.T) {
+		utilruntime.FeatureTestMutex.Lock()
+		defer utilruntime.FeatureTestMutex.Unlock()
+
+		require.NoError(t, utilruntime.ParseFeatures(fmt.Sprintf("%s=true", utilruntime.FeatureCountsAndLists)))
+
+		var list []*agonesv1.GameServer
+		gs1 := gsWithState(agonesv1.GameServerStateAllocated)
+		gs1.Status.Counters = map[string]agonesv1.CounterStatus{
+			"firstCounter":  {Count: 5, Capacity: 10},
+			"secondCounter": {Count: 100, Capacity: 1000},
+		}
+		gs2 := gsWithState(agonesv1.GameServerStateReserved)
+		gs2.Status.Counters = map[string]agonesv1.CounterStatus{
+			"firstCounter": {Count: 10, Capacity: 15},
+		}
+		gs3 := gsWithState(agonesv1.GameServerStateCreating)
+		gs3.Status.Counters = map[string]agonesv1.CounterStatus{
+			"firstCounter":  {Count: 20, Capacity: 30},
+			"secondCounter": {Count: 100, Capacity: 1000},
+		}
+		gs4 := gsWithState(agonesv1.GameServerStateReady)
+		gs4.Status.Counters = map[string]agonesv1.CounterStatus{
+			"firstCounter":  {Count: 15, Capacity: 30},
+			"secondCounter": {Count: 20, Capacity: 200},
+		}
+		list = append(list, gs1, gs2, gs3, gs4)
+
+		expected := agonesv1.GameServerSetStatus{
+			Replicas:          4,
+			ReadyReplicas:     1,
+			ReservedReplicas:  1,
+			AllocatedReplicas: 1,
+			Counters: map[string]agonesv1.AggregatedCounterStatus{
+				"firstCounter": {
+					AllocatedCount:    5,
+					AllocatedCapacity: 10,
+					Count:             50,
+					Capacity:          85,
+				},
+				"secondCounter": {
+					AllocatedCount:    100,
+					AllocatedCapacity: 1000,
+					Count:             220,
+					Capacity:          2200,
+				},
+			},
+			Lists: map[string]agonesv1.AggregatedListStatus{},
+		}
+
+		assert.Equal(t, expected, computeStatus(list))
+	})
+
+	t.Run("lists", func(t *testing.T) {
+		utilruntime.FeatureTestMutex.Lock()
+		defer utilruntime.FeatureTestMutex.Unlock()
+
+		require.NoError(t, utilruntime.ParseFeatures(fmt.Sprintf("%s=true", utilruntime.FeatureCountsAndLists)))
+
+		var list []*agonesv1.GameServer
+		gs1 := gsWithState(agonesv1.GameServerStateAllocated)
+		gs1.Status.Lists = map[string]agonesv1.ListStatus{
+			"firstList":  {Capacity: 10, Values: []string{"a", "b"}},
+			"secondList": {Capacity: 1000, Values: []string{"1", "2"}},
+		}
+		gs2 := gsWithState(agonesv1.GameServerStateReserved)
+		gs2.Status.Lists = map[string]agonesv1.ListStatus{
+			"firstList": {Capacity: 15, Values: []string{"c"}},
+		}
+		gs3 := gsWithState(agonesv1.GameServerStateCreating)
+		gs3.Status.Lists = map[string]agonesv1.ListStatus{
+			"firstList":  {Capacity: 30, Values: []string{"d"}},
+			"secondList": {Capacity: 1000, Values: []string{"3"}},
+		}
+		gs4 := gsWithState(agonesv1.GameServerStateReady)
+		gs4.Status.Lists = map[string]agonesv1.ListStatus{
+			"firstList":  {Capacity: 30},
+			"secondList": {Capacity: 100, Values: []string{"4", "5", "6"}},
+		}
+		list = append(list, gs1, gs2, gs3, gs4)
+
+		expected := agonesv1.GameServerSetStatus{
+			Replicas:          4,
+			ReadyReplicas:     1,
+			ReservedReplicas:  1,
+			AllocatedReplicas: 1,
+			Counters:          map[string]agonesv1.AggregatedCounterStatus{},
+			Lists: map[string]agonesv1.AggregatedListStatus{
+				"firstList": {
+					AllocatedCount:    2,
+					AllocatedCapacity: 10,
+					Capacity:          85,
+					Count:             4,
+				},
+				"secondList": {
+					AllocatedCount:    2,
+					AllocatedCapacity: 1000,
+					Capacity:          2100,
+					Count:             6,
+				},
+			},
+		}
+
+		assert.Equal(t, expected, computeStatus(list))
+	})
 }
 
 func TestControllerWatchGameServers(t *testing.T) {
 	t.Parallel()
+	utilruntime.FeatureTestMutex.Lock()
+	defer utilruntime.FeatureTestMutex.Unlock()
 
 	gsSet := defaultFixture()
 
@@ -504,6 +622,98 @@ func TestSyncGameServerSet(t *testing.T) {
 
 		assert.Equal(t, 6, count)
 		assert.True(t, updated, "A game servers should have been updated")
+	})
+
+	t.Run("adding and deleting errored gameservers", func(t *testing.T) {
+		gsSet := defaultFixture()
+		list := createGameServers(gsSet, 5)
+
+		// make some as unhealthy
+		list[0].Annotations = map[string]string{agonesv1.GameServerErroredAtAnnotation: time.Now().Add(-30 * time.Second).UTC().Format(time.RFC3339)}
+		list[0].Status.State = agonesv1.GameServerStateError
+
+		updated := false
+		count := 0
+
+		c, m := newFakeController()
+		m.AgonesClient.AddReactor("list", "gameserversets", func(action k8stesting.Action) (bool, runtime.Object, error) {
+			return true, &agonesv1.GameServerSetList{Items: []agonesv1.GameServerSet{*gsSet}}, nil
+		})
+		m.AgonesClient.AddReactor("list", "gameservers", func(action k8stesting.Action) (bool, runtime.Object, error) {
+			return true, &agonesv1.GameServerList{Items: list}, nil
+		})
+
+		m.AgonesClient.AddReactor("update", "gameservers", func(action k8stesting.Action) (bool, runtime.Object, error) {
+			ua := action.(k8stesting.UpdateAction)
+			gs := ua.GetObject().(*agonesv1.GameServer)
+			assert.Equal(t, gs.Status.State, agonesv1.GameServerStateShutdown)
+
+			updated = true
+			assert.Equal(t, "test-0", gs.GetName())
+			return true, nil, nil
+		})
+		m.AgonesClient.AddReactor("create", "gameservers", func(action k8stesting.Action) (bool, runtime.Object, error) {
+			ca := action.(k8stesting.CreateAction)
+			gs := ca.GetObject().(*agonesv1.GameServer)
+
+			assert.True(t, metav1.IsControlledBy(gs, gsSet))
+			count++
+			return true, gs, nil
+		})
+
+		ctx, cancel := agtesting.StartInformers(m, c.gameServerSetSynced, c.gameServerSynced)
+		defer cancel()
+
+		c.syncGameServerSet(ctx, gsSet.ObjectMeta.Namespace+"/"+gsSet.ObjectMeta.Name) // nolint: errcheck
+
+		assert.Equal(t, 6, count)
+		assert.True(t, updated, "A game servers should have been updated")
+	})
+
+	t.Run("adding and delay deleting errored gameservers", func(t *testing.T) {
+		gsSet := defaultFixture()
+		list := createGameServers(gsSet, 5)
+
+		// make some as unhealthy
+		list[0].Annotations = map[string]string{agonesv1.GameServerErroredAtAnnotation: time.Now().UTC().Format(time.RFC3339)}
+		list[0].Status.State = agonesv1.GameServerStateError
+
+		updated := false
+		count := 0
+
+		c, m := newFakeController()
+		m.AgonesClient.AddReactor("list", "gameserversets", func(action k8stesting.Action) (bool, runtime.Object, error) {
+			return true, &agonesv1.GameServerSetList{Items: []agonesv1.GameServerSet{*gsSet}}, nil
+		})
+		m.AgonesClient.AddReactor("list", "gameservers", func(action k8stesting.Action) (bool, runtime.Object, error) {
+			return true, &agonesv1.GameServerList{Items: list}, nil
+		})
+
+		m.AgonesClient.AddReactor("update", "gameservers", func(action k8stesting.Action) (bool, runtime.Object, error) {
+			ua := action.(k8stesting.UpdateAction)
+			gs := ua.GetObject().(*agonesv1.GameServer)
+			assert.Equal(t, gs.Status.State, agonesv1.GameServerStateShutdown)
+
+			updated = true
+			assert.Equal(t, "test-0", gs.GetName())
+			return true, nil, nil
+		})
+		m.AgonesClient.AddReactor("create", "gameservers", func(action k8stesting.Action) (bool, runtime.Object, error) {
+			ca := action.(k8stesting.CreateAction)
+			gs := ca.GetObject().(*agonesv1.GameServer)
+
+			assert.True(t, metav1.IsControlledBy(gs, gsSet))
+			count++
+			return true, gs, nil
+		})
+
+		ctx, cancel := agtesting.StartInformers(m, c.gameServerSetSynced, c.gameServerSynced)
+		defer cancel()
+
+		c.syncGameServerSet(ctx, gsSet.ObjectMeta.Namespace+"/"+gsSet.ObjectMeta.Name) // nolint: errcheck
+
+		assert.Equal(t, 5, count)
+		assert.False(t, updated, "A game servers should not have been updated")
 	})
 
 	t.Run("removing gamservers", func(t *testing.T) {
@@ -743,7 +953,7 @@ func TestControllerSyncGameServerSetStatus(t *testing.T) {
 func TestControllerUpdateValidationHandler(t *testing.T) {
 	t.Parallel()
 
-	c, _ := newFakeController()
+	ext := newFakeExtensions()
 	gvk := metav1.GroupVersionKind(agonesv1.SchemeGroupVersion.WithKind("GameServerSet"))
 	fixture := &agonesv1.GameServerSet{ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"},
 		Spec: agonesv1.GameServerSetSpec{Replicas: 5},
@@ -771,7 +981,7 @@ func TestControllerUpdateValidationHandler(t *testing.T) {
 			Response: &admissionv1.AdmissionResponse{Allowed: true},
 		}
 
-		result, err := c.updateValidationHandler(review)
+		result, err := ext.updateValidationHandler(review)
 		require.NoError(t, err)
 		if !assert.True(t, result.Response.Allowed) {
 			// show the reason of the failure
@@ -796,7 +1006,7 @@ func TestControllerUpdateValidationHandler(t *testing.T) {
 			Response: &admissionv1.AdmissionResponse{Allowed: true},
 		}
 
-		_, err := c.updateValidationHandler(review)
+		_, err := ext.updateValidationHandler(review)
 		require.Error(t, err)
 		assert.Equal(t, "error unmarshalling new GameServerSet json: : unexpected end of JSON input", err.Error())
 	})
@@ -821,7 +1031,7 @@ func TestControllerUpdateValidationHandler(t *testing.T) {
 			Response: &admissionv1.AdmissionResponse{Allowed: true},
 		}
 
-		_, err = c.updateValidationHandler(review)
+		_, err = ext.updateValidationHandler(review)
 		require.Error(t, err)
 		assert.Equal(t, "error unmarshalling old GameServerSet json: : unexpected end of JSON input", err.Error())
 	})
@@ -852,7 +1062,7 @@ func TestControllerUpdateValidationHandler(t *testing.T) {
 			Response: &admissionv1.AdmissionResponse{Allowed: true},
 		}
 
-		result, err := c.updateValidationHandler(review)
+		result, err := ext.updateValidationHandler(review)
 		require.NoError(t, err)
 		require.NotNil(t, result.Response)
 		require.NotNil(t, result.Response.Result)
@@ -861,14 +1071,15 @@ func TestControllerUpdateValidationHandler(t *testing.T) {
 		assert.NotEmpty(t, result.Response.Result.Details.Causes)
 		assert.Equal(t, metav1.StatusFailure, result.Response.Result.Status)
 		assert.Equal(t, metav1.StatusReasonInvalid, result.Response.Result.Reason)
-		assert.Equal(t, "GameServerSet update is invalid", result.Response.Result.Message)
+		assert.Contains(t, result.Response.Result.Message, "GameServerSet.agones.dev \"\" is invalid")
 	})
 }
 
 func TestCreationValidationHandler(t *testing.T) {
 	t.Parallel()
 
-	c, _ := newFakeController()
+	ext := newFakeExtensions()
+
 	gvk := metav1.GroupVersionKind(agonesv1.SchemeGroupVersion.WithKind("GameServerSet"))
 	fixture := &agonesv1.GameServerSet{ObjectMeta: metav1.ObjectMeta{Name: "c1", Namespace: "default"},
 		Spec: agonesv1.GameServerSetSpec{
@@ -904,7 +1115,7 @@ func TestCreationValidationHandler(t *testing.T) {
 			Response: &admissionv1.AdmissionResponse{Allowed: true},
 		}
 
-		result, err := c.creationValidationHandler(review)
+		result, err := ext.creationValidationHandler(review)
 		require.NoError(t, err)
 		if !assert.True(t, result.Response.Allowed) {
 			// show the reason of the failure
@@ -926,9 +1137,9 @@ func TestCreationValidationHandler(t *testing.T) {
 			Response: &admissionv1.AdmissionResponse{Allowed: true},
 		}
 
-		_, err := c.creationValidationHandler(review)
+		_, err := ext.creationValidationHandler(review)
 		require.Error(t, err)
-		assert.Equal(t, "error unmarshalling new GameServerSet json: : unexpected end of JSON input", err.Error())
+		assert.Equal(t, "error unmarshalling GameServerSet json after schema validation: : unexpected end of JSON input", err.Error())
 	})
 
 	t.Run("invalid gameserverset create", func(t *testing.T) {
@@ -954,7 +1165,7 @@ func TestCreationValidationHandler(t *testing.T) {
 			Response: &admissionv1.AdmissionResponse{Allowed: true},
 		}
 
-		result, err := c.creationValidationHandler(review)
+		result, err := ext.creationValidationHandler(review)
 		require.NoError(t, err)
 		require.NotNil(t, result.Response)
 		require.NotNil(t, result.Response.Result)
@@ -963,7 +1174,7 @@ func TestCreationValidationHandler(t *testing.T) {
 		assert.NotEmpty(t, result.Response.Result.Details.Causes)
 		assert.Equal(t, metav1.StatusFailure, result.Response.Result.Status)
 		assert.Equal(t, metav1.StatusReasonInvalid, result.Response.Result.Reason)
-		assert.Equal(t, "GameServerSet create is invalid", result.Response.Result.Message)
+		assert.Contains(t, result.Response.Result.Message, "GameServerSet.agones.dev \"\" is invalid")
 	})
 }
 
@@ -995,9 +1206,13 @@ func createGameServers(gsSet *agonesv1.GameServerSet, size int) []agonesv1.GameS
 // newFakeController returns a controller, backed by the fake Clientset
 func newFakeController() (*Controller, agtesting.Mocks) {
 	m := agtesting.NewMocks()
-	wh := webhooks.NewWebHook(http.NewServeMux())
 	counter := gameservers.NewPerNodeCounter(m.KubeInformerFactory, m.AgonesInformerFactory)
-	c := NewController(wh, healthcheck.NewHandler(), counter, m.KubeClient, m.ExtClient, m.AgonesClient, m.AgonesInformerFactory)
+	c := NewController(healthcheck.NewHandler(), counter, m.KubeClient, m.ExtClient, m.AgonesClient, m.AgonesInformerFactory)
 	c.recorder = m.FakeRecorder
 	return c, m
+}
+
+// newFakeExtensions returns an extensions struct
+func newFakeExtensions() *Extensions {
+	return NewExtensions(generic.New(), webhooks.NewWebHook(http.NewServeMux()))
 }

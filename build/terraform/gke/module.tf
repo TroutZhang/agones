@@ -20,7 +20,7 @@ terraform {
   required_version = ">= 1.0.0"
   required_providers {
     google = {
-      source = "hashicorp/google"
+      source  = "hashicorp/google"
       version = "~> 4.25.0"
     }
   }
@@ -63,9 +63,14 @@ variable "ping_service_type" {
   default = "LoadBalancer"
 }
 
-variable "zone" {
+variable "location" {
   default     = "us-west1-c"
-  description = "The GCP zone to create the cluster in"
+  description = "The GCP location to create the cluster in"
+}
+
+variable "zone" {
+  default     = ""
+  description = "The GCP zone to create the cluster in (deprecated, use `location`)"
 }
 
 variable "pull_policy" {
@@ -73,7 +78,7 @@ variable "pull_policy" {
 }
 
 variable "image_registry" {
-  default = "gcr.io/agones-images"
+  default = "us-docker.pkg.dev/agones-images/release"
 }
 
 variable "always_pull_sidecar" {
@@ -86,6 +91,18 @@ variable "image_pull_secret" {
 
 variable "log_level" {
   default = "info"
+}
+
+variable "autoscale" {
+  default = "false"
+}
+
+variable "min_node_count" {
+  default = "1"
+}
+
+variable "max_node_count" {
+  default = "5"
 }
 
 // Note: This is the number of gameserver nodes. The Agones module will automatically create an additional
@@ -116,6 +133,7 @@ module "gke_cluster" {
 
   cluster = {
     "name"                    = var.name
+    "location"                = var.location
     "zone"                    = var.zone
     "machineType"             = var.machine_type
     "initialNodeCount"        = var.node_count
@@ -124,6 +142,9 @@ module "gke_cluster" {
     "windowsInitialNodeCount" = var.windows_node_count
     "project"                 = var.project
     "network"                 = var.network
+    "autoscale"               = var.autoscale
+    "minNodeCount"            = var.min_node_count
+    "maxNodeCount"            = var.max_node_count
   }
 }
 
@@ -148,7 +169,7 @@ output "host" {
   value = module.gke_cluster.host
 }
 output "token" {
-  value = module.gke_cluster.token
+  value     = module.gke_cluster.token
   sensitive = true
 }
 output "cluster_ca_certificate" {

@@ -12,6 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+{{- $replicas := (int .Values.agones.controller.replicas) }}
+{{- if lt $replicas 1 }}
+{{- fail "agones.controller.replica field has an invalid value!" }}
+{{- end }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -30,13 +34,15 @@ spec:
       app: {{ template "agones.name" . }}
       release: {{ .Release.Name }}
       heritage: {{ .Release.Service }}
-  replicas: 1
+  replicas: {{ $replicas }}
   strategy:
     type: Recreate
   template:
     metadata:
       annotations:
+{{- if eq $replicas 1 }}
         cluster-autoscaler.kubernetes.io/safe-to-evict: {{ .Values.agones.controller.safeToEvict | quote }}
+{{- end }}
 {{- if .Values.agones.controller.generateTLS }}
         revision/tls-cert: {{ .Release.Revision | quote }}
 {{- end }}
@@ -54,9 +60,28 @@ spec:
         release: {{ .Release.Name }}
         heritage: {{ .Release.Service }}
     spec:
-      {{- if .Values.agones.controller.affinity }}
       affinity:
+      {{- if .Values.agones.controller.affinity }}
+      {{- if .Values.agones.requireDedicatedNodes }}
+      {{- fail "agones.controller.affinity and agones.requireDedicatedNodes cannot be set at the same time!" }}
+      {{- end}}
+      {{- end}}
+      {{- if .Values.agones.controller.affinity }}
 {{ toYaml .Values.agones.controller.affinity | indent 8 }}
+      {{- else}}
+        nodeAffinity:
+          {{- if .Values.agones.requireDedicatedNodes }}
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+          {{- else}}
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 1
+            preference:
+              matchExpressions:
+          {{- end }}
+              - key: agones.dev/agones-system
+                operator: Exists
       {{- end }}
       {{- if .Values.agones.controller.nodeSelector }}
       nodeSelector:
@@ -115,9 +140,11 @@ spec:
           value: {{ .Values.agones.featureGates | quote }}
         - name: ALLOCATION_BATCH_WAIT_TIME
           value: {{ .Values.agones.controller.allocationBatchWaitTime | quote }}
+        - name: CLOUD_PRODUCT
+          value: {{ .Values.agones.cloudProduct | quote }}
 {{- if .Values.agones.controller.persistentLogs }}
         - name: LOG_DIR
-          value: "/home/agones/logs"
+          value: "/logs"
         - name: LOG_SIZE_LIMIT_MB
           value: {{ .Values.agones.controller.persistentLogsSizeLimitMB | quote }}
 {{- end }}
@@ -131,6 +158,10 @@ spec:
               fieldPath: metadata.namespace
         - name: CONTAINER_NAME
           value: "agones-controller"
+        {{- if gt $replicas 1 }}
+        - name: LEADER_ELECTION
+          value: "true"
+        {{- end }}
         ports:
         - name: webhooks
           containerPort: 8081
@@ -144,17 +175,22 @@ spec:
           periodSeconds: {{ .Values.agones.controller.healthCheck.periodSeconds }}
           failureThreshold: {{ .Values.agones.controller.healthCheck.failureThreshold }}
           timeoutSeconds: {{ .Values.agones.controller.healthCheck.timeoutSeconds }}
-{{- if .Values.agones.controller.resources }}
         resources:
+{{- if .Values.agones.controller.resources }}
 {{ toYaml .Values.agones.controller.resources | indent 10 }}
+{{- else}}
+          limits:
+            ephemeral-storage: {{ add .Values.agones.controller.persistentLogsSizeLimitMB 100 | printf "%dMi" }}
+          requests:
+            ephemeral-storage: {{ add .Values.agones.controller.persistentLogsSizeLimitMB 100 | printf "%dMi" }}
 {{- end }}
         volumeMounts:
         - name: certs
-          mountPath: /home/agones/certs
+          mountPath: /certs
           readOnly: true
 {{- if .Values.agones.controller.persistentLogs }}
         - name: logs
-          mountPath: /home/agones/logs
+          mountPath: /logs
           readOnly: false
 {{- end }}
       volumes:
@@ -172,4 +208,25 @@ spec:
 {{- if .Values.agones.image.controller.pullSecret }}
       imagePullSecrets:
         - name: {{.Values.agones.image.controller.pullSecret}}
+{{- end }}
+---
+{{- if gt $replicas 1 }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: agones-controller-pdb
+spec:
+{{- if .Values.agones.controller.pdb.minAvailable }}
+{{- if .Values.agones.controller.pdb.maxUnavailable }}
+{{- fail "minAvailable and maxUnavailable are mutually exclusive!" }}
+{{- end}}
+{{- end}}
+  minAvailable: {{ .Values.agones.controller.pdb.minAvailable }}
+  maxUnavailable: {{ .Values.agones.controller.pdb.maxUnavailable }}
+  selector:
+    matchLabels:
+      agones.dev/role: controller
+      app: {{ template "agones.name" . }}
+      release: {{ .Release.Name }}
+      heritage: {{ .Release.Service }}
 {{- end }}

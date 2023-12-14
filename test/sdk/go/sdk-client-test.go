@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Binary sdk-client-test tests the Go SDK client.
 package main
 
 import (
@@ -23,6 +24,7 @@ import (
 	pkgSdk "agones.dev/agones/pkg/sdk"
 	"agones.dev/agones/pkg/util/runtime"
 	goSdk "agones.dev/agones/sdks/go"
+	"github.com/google/go-cmp/cmp"
 	"github.com/spf13/pflag"
 	"github.com/spf13/viper"
 )
@@ -94,53 +96,147 @@ func main() {
 	}
 
 	if runtime.FeatureEnabled(runtime.FeaturePlayerTracking) {
-		capacity := int64(10)
-		if err = sdk.Alpha().SetPlayerCapacity(capacity); err != nil {
-			log.Fatalf("Error setting player capacity: %s", err)
-		}
+		testPlayerTracking(sdk)
+	}
 
-		c, err := sdk.Alpha().GetPlayerCapacity()
-		if err != nil {
-			log.Fatalf("Error getting player capacity: %s", err)
-		}
-		if c != capacity {
-			log.Fatalf("Player Capacity should be %d, but is %d", capacity, c)
-		}
-
-		playerID := "1234"
-		if ok, err := sdk.Alpha().PlayerConnect(playerID); err != nil {
-			log.Fatalf("Error registering player as connected: %s", err)
-		} else if !ok {
-			log.Fatalf("PlayerConnect returned false")
-		}
-
-		if ok, err := sdk.Alpha().IsPlayerConnected(playerID); err != nil {
-			log.Fatalf("Error checking if player is connected: %s", err)
-		} else if !ok {
-			log.Fatalf("IsPlayerConnected returned false")
-		}
-
-		if list, err := sdk.Alpha().GetConnectedPlayers(); err != nil {
-			log.Fatalf("Error getting connected player: %s", err)
-		} else if len(list) == 0 {
-			log.Fatalf("No connected players returned")
-		}
-
-		if ok, err := sdk.Alpha().PlayerDisconnect(playerID); err != nil {
-			log.Fatalf("Error registering player as disconnected: %s", err)
-		} else if !ok {
-			log.Fatalf("PlayerDisconnect returned false")
-		}
-
-		if c, err = sdk.Alpha().GetPlayerCount(); err != nil {
-			log.Fatalf("Error retrieving player count: %s", err)
-		} else if c != int64(0) {
-			log.Fatalf("Player Count should be 0, but is %d", c)
-		}
+	if runtime.FeatureEnabled(runtime.FeatureCountsAndLists) {
+		testCounts(sdk)
+		testLists(sdk)
 	}
 
 	err = sdk.Shutdown()
 	if err != nil {
 		log.Fatalf("Could not shutdown GameServer: %s", err)
+	}
+}
+
+func testPlayerTracking(sdk *goSdk.SDK) {
+	capacity := int64(10)
+	if err := sdk.Alpha().SetPlayerCapacity(capacity); err != nil {
+		log.Fatalf("Error setting player capacity: %s", err)
+	}
+
+	c, err := sdk.Alpha().GetPlayerCapacity()
+	if err != nil {
+		log.Fatalf("Error getting player capacity: %s", err)
+	}
+	if c != capacity {
+		log.Fatalf("Player Capacity should be %d, but is %d", capacity, c)
+	}
+
+	playerID := "1234"
+	if ok, err := sdk.Alpha().PlayerConnect(playerID); err != nil {
+		log.Fatalf("Error registering player as connected: %s", err)
+	} else if !ok {
+		log.Fatalf("PlayerConnect returned false")
+	}
+
+	if ok, err := sdk.Alpha().IsPlayerConnected(playerID); err != nil {
+		log.Fatalf("Error checking if player is connected: %s", err)
+	} else if !ok {
+		log.Fatalf("IsPlayerConnected returned false")
+	}
+
+	if list, err := sdk.Alpha().GetConnectedPlayers(); err != nil {
+		log.Fatalf("Error getting connected player: %s", err)
+	} else if len(list) == 0 {
+		log.Fatalf("No connected players returned")
+	}
+
+	if ok, err := sdk.Alpha().PlayerDisconnect(playerID); err != nil {
+		log.Fatalf("Error registering player as disconnected: %s", err)
+	} else if !ok {
+		log.Fatalf("PlayerDisconnect returned false")
+	}
+
+	if c, err = sdk.Alpha().GetPlayerCount(); err != nil {
+		log.Fatalf("Error retrieving player count: %s", err)
+	} else if c != int64(0) {
+		log.Fatalf("Player Count should be 0, but is %d", c)
+	}
+}
+
+func testCounts(sdk *goSdk.SDK) {
+	// LocalSDKServer starting "conformanceTestCounter": {Count: 1, Capacity: 10}
+	counter := "conformanceTestCounter"
+	count, err := sdk.Alpha().GetCounterCount(counter)
+	if err != nil {
+		log.Fatalf("Error getting Counter count: %s", err)
+	} else if count != int64(1) {
+		log.Fatalf("Counter count should be 1, but is %d", count)
+	}
+
+	inc, err := sdk.Alpha().IncrementCounter(counter, 9)
+	if !inc {
+		log.Fatalf("Error incrementing Counter: %s", err)
+	}
+
+	dec, err := sdk.Alpha().DecrementCounter(counter, 10)
+	if !dec {
+		log.Fatalf("Error decrementing Counter: %s", err)
+	}
+
+	setCount, err := sdk.Alpha().SetCounterCount(counter, 10)
+	if !setCount {
+		log.Fatalf("Error setting Counter count: %s", err)
+	}
+
+	capacity, err := sdk.Alpha().GetCounterCapacity(counter)
+	if err != nil {
+		log.Fatalf("Error getting Counter capacity: %s", err)
+	} else if capacity != int64(10) {
+		log.Fatalf("Counter capacity should be 10, but is %d", capacity)
+	}
+
+	setCapacity, err := sdk.Alpha().SetCounterCapacity(counter, 1)
+	if !setCapacity {
+		log.Fatalf("Error setting Counter capacity: %s", err)
+	}
+}
+
+func testLists(sdk *goSdk.SDK) {
+	// LocalSDKServer starting "conformanceTestList": {Values: []string{"test0", "test1", "test2"}, Capacity: 100}}
+	list := "conformanceTestList"
+	vals := []string{"test0", "test1", "test2"}
+
+	contains, err := sdk.Alpha().ListContains(list, "test1")
+	if !contains {
+		log.Fatalf("List should contain value \"test1\" err: %s", err)
+	}
+
+	length, err := sdk.Alpha().GetListLength(list)
+	if err != nil {
+		log.Fatalf("Error getting List length: %s", err)
+	} else if int64(length) != 3 {
+		log.Fatalf("List length should be 3, but is %d", length)
+	}
+
+	values, err := sdk.Alpha().GetListValues(list)
+	if err != nil {
+		log.Fatalf("Error getting List values: %s", err)
+	} else if !cmp.Equal(vals, values) {
+		log.Fatalf("List values should be %v, but is %v", vals, values)
+	}
+
+	appendValue, err := sdk.Alpha().AppendListValue(list, "test3")
+	if !appendValue {
+		log.Fatalf("Unable to append value \"test3\" err: %s", err)
+	}
+
+	deleteValue, err := sdk.Alpha().DeleteListValue(list, "test2")
+	if !deleteValue {
+		log.Fatalf("Unable to delete value \"test2\" err: %s", err)
+	}
+
+	capacity, err := sdk.Alpha().GetListCapacity(list)
+	if err != nil {
+		log.Fatalf("Error getting List capacity: %s", err)
+	} else if capacity != int64(100) {
+		log.Fatalf("List capacity should be 100, but is %d", capacity)
+	}
+
+	setCapacity, err := sdk.Alpha().SetListCapacity(list, 2)
+	if !setCapacity {
+		log.Fatalf("Error setting List capacity: %s", err)
 	}
 }

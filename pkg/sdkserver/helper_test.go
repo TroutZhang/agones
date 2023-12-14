@@ -31,7 +31,7 @@ import (
 
 func testHTTPHealth(t *testing.T, url string, expectedResponse string, expectedStatus int) {
 	// do a poll, because this code could run before the health check becomes live
-	err := wait.PollImmediate(time.Second, 20*time.Second, func() (done bool, err error) {
+	err := wait.PollUntilContextTimeout(context.Background(), time.Second, 20*time.Second, true, func(ctx context.Context) (done bool, err error) {
 		resp, err := http.Get(url)
 		if err != nil {
 			logrus.WithError(err).Error("Error connecting to ", url)
@@ -98,12 +98,14 @@ func (m *emptyMockStream) RecvMsg(msg interface{}) error {
 }
 
 type gameServerMockStream struct {
+	ctx  context.Context
 	msgs chan *sdk.GameServer
 }
 
 // newGameServerMockStream implements SDK_WatchGameServerServer for testing
 func newGameServerMockStream() *gameServerMockStream {
 	return &gameServerMockStream{
+		ctx:  context.Background(),
 		msgs: make(chan *sdk.GameServer, 10),
 	}
 }
@@ -125,8 +127,8 @@ func (*gameServerMockStream) SetTrailer(metadata.MD) {
 	panic("implement me")
 }
 
-func (*gameServerMockStream) Context() netcontext.Context {
-	panic("implement me")
+func (m *gameServerMockStream) Context() netcontext.Context {
+	return m.ctx
 }
 
 func (*gameServerMockStream) SendMsg(m interface{}) error {

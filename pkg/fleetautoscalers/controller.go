@@ -30,6 +30,7 @@ import (
 	"agones.dev/agones/pkg/client/informers/externalversions"
 	listeragonesv1 "agones.dev/agones/pkg/client/listers/agones/v1"
 	listerautoscalingv1 "agones.dev/agones/pkg/client/listers/autoscaling/v1"
+	"agones.dev/agones/pkg/gameservers"
 	"agones.dev/agones/pkg/util/crd"
 	"agones.dev/agones/pkg/util/logfields"
 	"agones.dev/agones/pkg/util/runtime"
@@ -47,26 +48,37 @@ import (
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
+	runtimeschema "k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/apimachinery/pkg/util/clock"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
 	typedcorev1 "k8s.io/client-go/kubernetes/typed/core/v1"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/record"
+	"k8s.io/utils/clock"
 )
 
 // fasThread is used for tracking each Fleet's autoscaling jobs
+//
+//nolint:govet // ignore fieldalignment, one per fleet autoscaler
 type fasThread struct {
 	generation int64
 	cancel     context.CancelFunc
 }
 
+// Extensions struct contains what is needed to bind webhook handlers
+type Extensions struct {
+	baseLogger *logrus.Entry
+}
+
 // Controller is the FleetAutoscaler controller
+//
+//nolint:govet // ignore fieldalignment, singleton
 type Controller struct {
 	baseLogger            *logrus.Entry
-	clock                 clock.Clock
+	clock                 clock.WithTickerAndDelayedExecution
+	counter               *gameservers.PerNodeCounter
 	crdGetter             apiextclientv1.CustomResourceDefinitionInterface
 	fasThreads            map[types.UID]fasThread
 	fasThreadMutex        sync.Mutex
@@ -78,21 +90,25 @@ type Controller struct {
 	fleetAutoscalerSynced cache.InformerSynced
 	workerqueue           *workerqueue.WorkerQueue
 	recorder              record.EventRecorder
+	gameServerLister      listeragonesv1.GameServerLister
 }
 
 // NewController returns a controller for a FleetAutoscaler
 func NewController(
-	wh *webhooks.WebHook,
 	health healthcheck.Handler,
 	kubeClient kubernetes.Interface,
 	extClient extclientset.Interface,
 	agonesClient versioned.Interface,
-	agonesInformerFactory externalversions.SharedInformerFactory) *Controller {
+	agonesInformerFactory externalversions.SharedInformerFactory,
+	counter *gameservers.PerNodeCounter) *Controller {
 
 	autoscaler := agonesInformerFactory.Autoscaling().V1().FleetAutoscalers()
 	fleetInformer := agonesInformerFactory.Agones().V1().Fleets()
+	gameServers := agonesInformerFactory.Agones().V1().GameServers()
+
 	c := &Controller{
 		clock:                 clock.RealClock{},
+		counter:               counter,
 		crdGetter:             extClient.ApiextensionsV1().CustomResourceDefinitions(),
 		fasThreads:            map[types.UID]fasThread{},
 		fasThreadMutex:        sync.Mutex{},
@@ -102,6 +118,7 @@ func NewController(
 		fleetAutoscalerGetter: agonesClient.AutoscalingV1(),
 		fleetAutoscalerLister: autoscaler.Lister(),
 		fleetAutoscalerSynced: autoscaler.Informer().HasSynced,
+		gameServerLister:      gameServers.Lister(),
 	}
 	c.baseLogger = runtime.NewLoggerWithType(c)
 	c.workerqueue = workerqueue.NewWorkerQueueWithRateLimiter(c.syncFleetAutoscaler, c.baseLogger, logfields.FleetAutoscalerKey, autoscaling.GroupName+".FleetAutoscalerController", workerqueue.FastRateLimiter(3*time.Second))
@@ -112,40 +129,40 @@ func NewController(
 	eventBroadcaster.StartRecordingToSink(&typedcorev1.EventSinkImpl{Interface: kubeClient.CoreV1().Events("")})
 	c.recorder = eventBroadcaster.NewRecorder(scheme.Scheme, corev1.EventSource{Component: "fleetautoscaler-controller"})
 
-	kind := autoscalingv1.Kind("FleetAutoscaler")
-	wh.AddHandler("/mutate", kind, admissionv1.Create, c.mutationHandler)
-	wh.AddHandler("/mutate", kind, admissionv1.Update, c.mutationHandler)
-	wh.AddHandler("/validate", kind, admissionv1.Create, c.validationHandler)
-	wh.AddHandler("/validate", kind, admissionv1.Update, c.validationHandler)
-
-	autoscaler.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+	_, _ = autoscaler.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
-			if runtime.FeatureEnabled(runtime.FeatureCustomFasSyncInterval) {
-				c.addFasThread(obj.(*autoscalingv1.FleetAutoscaler), true)
-			} else {
-				c.workerqueue.Enqueue(obj)
-			}
+			c.addFasThread(obj.(*autoscalingv1.FleetAutoscaler), true)
 		},
 		UpdateFunc: func(_, newObj interface{}) {
-			if runtime.FeatureEnabled(runtime.FeatureCustomFasSyncInterval) {
-				c.updateFasThread(newObj.(*autoscalingv1.FleetAutoscaler))
-			} else {
-				c.workerqueue.Enqueue(newObj)
-			}
+			c.updateFasThread(newObj.(*autoscalingv1.FleetAutoscaler))
 		},
 		DeleteFunc: func(obj interface{}) {
-			if runtime.FeatureEnabled(runtime.FeatureCustomFasSyncInterval) {
-				// Could be a DeletedFinalStateUnknown, in which case, just ignore it
-				fas, ok := obj.(*autoscalingv1.FleetAutoscaler)
-				if !ok {
-					return
-				}
-				c.deleteFasThread(fas, true)
+			// Could be a DeletedFinalStateUnknown, in which case, just ignore it
+			fas, ok := obj.(*autoscalingv1.FleetAutoscaler)
+			if !ok {
+				return
 			}
+			c.deleteFasThread(fas, true)
 		},
 	})
 
 	return c
+}
+
+// NewExtensions binds the handlers to the webhook outside the initialization of the controller
+// initializes a new logger for extensions.
+func NewExtensions(wh *webhooks.WebHook) *Extensions {
+	ext := &Extensions{}
+
+	ext.baseLogger = runtime.NewLoggerWithType(ext)
+
+	kind := autoscalingv1.Kind("FleetAutoscaler")
+	wh.AddHandler("/mutate", kind, admissionv1.Create, ext.mutationHandler)
+	wh.AddHandler("/mutate", kind, admissionv1.Update, ext.mutationHandler)
+	wh.AddHandler("/validate", kind, admissionv1.Create, ext.validationHandler)
+	wh.AddHandler("/validate", kind, admissionv1.Update, ext.validationHandler)
+
+	return ext
 }
 
 // Run the FleetAutoscaler controller. Will block until stop is closed.
@@ -175,27 +192,36 @@ func (c *Controller) Run(ctx context.Context, workers int) error {
 	return nil
 }
 
-func (c *Controller) loggerForFleetAutoscalerKey(key string) *logrus.Entry {
-	return logfields.AugmentLogEntry(c.baseLogger, logfields.FleetAutoscalerKey, key)
+func loggerForFleetAutoscalerKey(key string, logger *logrus.Entry) *logrus.Entry {
+	return logfields.AugmentLogEntry(logger, logfields.FleetAutoscalerKey, key)
 }
 
-func (c *Controller) loggerForFleetAutoscaler(fas *autoscalingv1.FleetAutoscaler) *logrus.Entry {
+func loggerForFleetAutoscaler(fas *autoscalingv1.FleetAutoscaler, logger *logrus.Entry) *logrus.Entry {
 	fasName := "NilFleetAutoScaler"
 	if fas != nil {
 		fasName = fas.Namespace + "/" + fas.Name
 	}
-	return c.loggerForFleetAutoscalerKey(fasName).WithField("fas", fas)
+	return loggerForFleetAutoscalerKey(fasName, logger).WithField("fas", fas)
+}
+
+func (c *Controller) loggerForFleetAutoscalerKey(key string) *logrus.Entry {
+	return loggerForFleetAutoscalerKey(key, c.baseLogger)
+}
+
+func (c *Controller) loggerForFleetAutoscaler(fas *autoscalingv1.FleetAutoscaler) *logrus.Entry {
+	return loggerForFleetAutoscaler(fas, c.baseLogger)
 }
 
 // creationMutationHandler is the handler for the mutating webhook that sets the
 // the default values on the FleetAutoscaler
-func (c *Controller) mutationHandler(review admissionv1.AdmissionReview) (admissionv1.AdmissionReview, error) {
+func (ext *Extensions) mutationHandler(review admissionv1.AdmissionReview) (admissionv1.AdmissionReview, error) {
 	obj := review.Request.Object
 	fas := &autoscalingv1.FleetAutoscaler{}
 	err := json.Unmarshal(obj.Raw, fas)
 	if err != nil {
-		c.baseLogger.WithField("review", review).WithError(err).Error("validationHandler")
-		return review, errors.Wrapf(err, "error unmarshalling original FleetAutoscaler json: %s", obj.Raw)
+		// If the JSON is invalid during mutation, fall through to validation. This allows OpenAPI schema validation
+		// to proceed, resulting in a more user friendly error message.
+		return review, nil
 	}
 
 	fas.ApplyDefaults()
@@ -224,31 +250,25 @@ func (c *Controller) mutationHandler(review admissionv1.AdmissionReview) (admiss
 
 // validationHandler will intercept when a FleetAutoscaler is created, and
 // validate its settings.
-func (c *Controller) validationHandler(review admissionv1.AdmissionReview) (admissionv1.AdmissionReview, error) {
+func (ext *Extensions) validationHandler(review admissionv1.AdmissionReview) (admissionv1.AdmissionReview, error) {
 	obj := review.Request.Object
 	fas := &autoscalingv1.FleetAutoscaler{}
 	err := json.Unmarshal(obj.Raw, fas)
 	if err != nil {
-		c.baseLogger.WithField("review", review).WithError(err).Error("validationHandler")
-		return review, errors.Wrapf(err, "error unmarshalling original FleetAutoscaler json: %s", obj.Raw)
+		ext.baseLogger.WithField("review", review).WithError(err).Error("validationHandler")
+		return review, errors.Wrapf(err, "error unmarshalling FleetAutoscaler json after schema validation: %s", obj.Raw)
 	}
 	fas.ApplyDefaults()
-	var causes []metav1.StatusCause
-	causes = fas.Validate(causes)
-	if len(causes) != 0 {
+
+	if errs := fas.Validate(); len(errs) > 0 {
+		kind := runtimeschema.GroupKind{
+			Group: review.Request.Kind.Group,
+			Kind:  review.Request.Kind.Kind,
+		}
+		statusErr := k8serrors.NewInvalid(kind, review.Request.Name, errs)
 		review.Response.Allowed = false
-		details := metav1.StatusDetails{
-			Name:   review.Request.Name,
-			Group:  review.Request.Kind.Group,
-			Kind:   review.Request.Kind.Kind,
-			Causes: causes,
-		}
-		review.Response.Result = &metav1.Status{
-			Status:  metav1.StatusFailure,
-			Message: "FleetAutoscaler is invalid",
-			Reason:  metav1.StatusReasonInvalid,
-			Details: &details,
-		}
+		review.Response.Result = &statusErr.ErrStatus
+		loggerForFleetAutoscaler(fas, ext.baseLogger).WithField("review", review).Debug("Invalid FleetAutoscaler")
 	}
 
 	return review, nil
@@ -264,12 +284,7 @@ func (c *Controller) syncFleetAutoscaler(ctx context.Context, key string) error 
 	}
 
 	if fas == nil {
-		// just in case we don't catch a delete event for some reason, use this as a
-		// failsafe to ensure we don't end up leaking goroutines.
-		if runtime.FeatureEnabled(runtime.FeatureCustomFasSyncInterval) {
-			return c.cleanFasThreads(key)
-		}
-		return nil
+		return c.cleanFasThreads(key)
 	}
 
 	// Retrieve the fleet by spec name
@@ -298,7 +313,7 @@ func (c *Controller) syncFleetAutoscaler(ctx context.Context, key string) error 
 	}
 
 	currentReplicas := fleet.Status.Replicas
-	desiredReplicas, scalingLimited, err := computeDesiredFleetSize(fas, fleet)
+	desiredReplicas, scalingLimited, err := computeDesiredFleetSize(fas, fleet, c.gameServerLister, c.counter.Counts())
 	if err != nil {
 		c.recorder.Eventf(fas, corev1.EventTypeWarning, "FleetAutoscaler",
 			"Error calculating desired fleet size on FleetAutoscaler %s. Error: %s", fas.ObjectMeta.Name, err.Error())

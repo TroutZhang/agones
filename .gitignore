@@ -13,6 +13,7 @@
 # limitations under the License.
 
 .*
+!/.yamllint
 !.gitignore
 !.helmignore
 !.gitattributes
@@ -37,4 +38,5 @@ build/allocation
 debug.test
 obj
 test/sdk/cpp/sdk/
+build/scripts/k8s-export-openapi/main
 

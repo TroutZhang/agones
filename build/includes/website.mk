@@ -23,12 +23,14 @@
 #
 # Website targets
 #
+UID := $(shell id -u)
+GID := $(shell id -g)
 
 # generate the latest website
 site-server: ARGS ?=-F
 site-server: ENV ?= RELEASE_VERSION="$(base_version)" RELEASE_BRANCH=main
 site-server: ensure-build-image
-	docker run --rm $(common_mounts) --workdir=$(mount_path)/site $(DOCKER_RUN_ARGS) -p 1313:1313 $(build_tag) bash -c \
+	docker run --user $(UID):$(GID) --rm $(common_mounts) --workdir=$(mount_path)/site $(DOCKER_RUN_ARGS) -p 1313:1313 $(build_tag) bash -c \
 	"$(ENV) hugo server --watch --baseURL=http://localhost:1313/ --bind=0.0.0.0 $(ARGS)"
 
 site-static: ensure-build-image
@@ -42,7 +44,7 @@ site-static: ensure-build-image
 	docker run --rm $(common_mounts) --workdir=$(mount_path)/site $(DOCKER_RUN_ARGS) $(build_tag) \
 		bash -c "npm list autoprefixer || npm install autoprefixer@9.8.6"
 	docker run --rm $(common_mounts) --workdir=$(mount_path)/site $(DOCKER_RUN_ARGS) $(build_tag) bash -c \
-		"$(ENV) hugo --config=config.toml $(ARGS)"
+        "git config --global --add safe.directory /go/src/agones.dev/agones &&  $(ENV) hugo --config=config.toml $(ARGS)"
 
 site-gen-app-yaml: SERVICE ?= default
 site-gen-app-yaml:
@@ -50,7 +52,7 @@ site-gen-app-yaml:
 			"SERVICE=$(SERVICE) envsubst < app.yaml > .app.yaml"
 
 site-deploy: site-gen-app-yaml site-static
-	docker run -t --rm $(common_mounts) --workdir=$(mount_path) $(DOCKER_RUN_ARGS) \
+	docker run --network=cloudbuild -t --rm $(common_mounts) --workdir=$(mount_path) $(DOCKER_RUN_ARGS) \
 	-e GO111MODULE=on -e SHORT_SHA=$(shell git rev-parse --short=7 HEAD) $(build_tag) bash -c \
 	'printenv && cd  ./site && \
     gcloud app deploy .app.yaml --no-promote --quiet --version=$$SHORT_SHA'
@@ -75,6 +77,7 @@ site-test:
 
 # generate site images, if they don't exist
 site-images: $(site_path)/static/diagrams/gameserver-states.dot.png
+site-images: $(site_path)/static/diagrams/eviction-decision.dot.png
 site-images: $(site_path)/static/diagrams/gameserver-lifecycle.puml.png
 site-images: $(site_path)/static/diagrams/gameserver-reserved.puml.png
 site-images: $(site_path)/static/diagrams/canary-testing.puml.png
@@ -108,3 +111,30 @@ test-gen-api-docs: ensure-build-image
 	$(GEN_API_DOCS)
 	sort $(expected_docs) > /tmp/result.sorted
 	diff -bB /tmp/result.sorted /tmp/generated.html.sorted
+
+# Remove feature expiry/publish version shortcodes update in site/content/en/docs
+feature-shortcode-update: ensure-build-image
+	docker run --rm $(common_mounts) --workdir=$(mount_path) $(DOCKER_RUN_ARGS) $(build_tag) \
+		go run build/scripts/feature-shortcode-update/main.go -version=$(version)
+
+# update SDKS/Install version
+sdk-update-version: ensure-build-image
+	docker run --rm $(common_mounts) --workdir=$(mount_path) $(DOCKER_RUN_ARGS) $(build_tag) \
+		go run build/scripts/sdk-update-version/main.go -release-stage=$(release_stage) -version=$(version)
+
+# delete "data-proofer-ignore" attribute from previous release blog.
+del-data-proofer-ignore: FILENAME ?= ""
+del-data-proofer-ignore: ensure-build-image
+	docker run --rm $(common_mounts) --workdir=$(mount_path) $(DOCKER_RUN_ARGS) $(build_tag) \
+		go run build/scripts/remove-data-proofer-ignore/main.go -file=$(FILENAME)
+
+# update release version and replicate data between dev and prod in site/config.toml
+site-config-update-version: ensure-build-image
+	docker run --rm $(common_mounts) --workdir=$(mount_path) $(DOCKER_RUN_ARGS) $(build_tag) \
+		go run build/scripts/site-config-update-version/main.go
+
+# Delete old release version in site/layouts/partials/navbar.html.
+update-navbar-version: FILENAME ?= ""
+update-navbar-version: ensure-build-image
+	docker run --rm $(common_mounts) --workdir=$(mount_path) $(DOCKER_RUN_ARGS) $(build_tag) \
+		go run build/scripts/update-navbar-version/main.go -file=$(FILENAME)

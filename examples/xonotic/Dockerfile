@@ -13,20 +13,20 @@
 # limitations under the License.
 
 # build
-FROM golang:1.19.1 as builder
+FROM golang:1.20.10 as builder
 
 RUN apt-get update && apt-get install -y unzip curl
 
-COPY . /go/src/examples/xonotic
 WORKDIR /go/src/examples/xonotic
+COPY . /go/src/examples/xonotic
 RUN go build -o wrapper .
 
 WORKDIR /go/src/xonotic
-RUN curl -o xonotic.zip https://dl.xonotic.org/xonotic-0.8.5.zip && \
+RUN curl -o xonotic.zip https://dl.xonotic.org/xonotic-0.8.6.zip && \
     unzip -qq xonotic.zip && rm xonotic.zip
 
 # final image
-FROM debian:bullseye
+FROM debian:bookworm
 
 WORKDIR /home/xonotic
 

@@ -46,6 +46,17 @@ status:
             type: integer
     address:
       type: string
+    addresses:
+      type: array
+      title: Array of addresses at which the GameServer can be reached; copy of Node.Status.addresses
+      nullable: true
+      items:
+        type: object
+        properties:
+          address:
+            type: string
+          type:
+            type: string
     nodeName:
       type: string
     reservedUntil:
@@ -65,4 +76,58 @@ status:
           nullable: true
           items:
             type: string
+    counters:
+      type: object
+      title: Map of player, room, session, etc. counters
+      nullable: true
+      maxProperties: 1000
+      additionalProperties:
+        type: object
+        properties:
+          count:
+            title: The current count
+            type: integer
+            default: 0
+            minimum: 0
+          capacity:
+            type: integer
+            default: 1000
+            minimum: 0
+    lists:
+      type: object
+      title: Map of player, room, session, etc. lists
+      nullable: true
+      maxProperties: 1000
+      additionalProperties:
+        type: object
+        properties:
+          capacity:
+            title: Max capacity of the array (can be less than or equal to value of values.maxItems)
+            type: integer
+            minimum: 0
+            default: 1000
+            maximum: 1000 # must be equal to values.maxItems
+          values:
+            title: Set of all the items in the list
+            type: array
+            x-kubernetes-list-type: set # Requires items in the array to be unique
+            maxItems: 1000 # max possible size of the value array (cannot be updated)
+            items: # name of the item (player1, session1, room1, etc.)
+              type: string
+            default: []
+    eviction:
+      type: object
+      properties:
+        safe:
+          type: string
+          enum:
+          - Always
+          - OnUpgrade
+          - Never
+    immutableReplicas:
+      type: integer
+      title: Immutable count of Pods to a GameServer. Always 1. (Implementation detail of implementing the Scale subresource.)
+      default: 1
+      minimum: 1
+      maximum: 1
 {{- end}}

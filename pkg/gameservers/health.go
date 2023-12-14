@@ -54,14 +54,17 @@ type HealthController struct {
 	gameServerLister listerv1.GameServerLister
 	workerqueue      *workerqueue.WorkerQueue
 	recorder         record.EventRecorder
+	waitOnFreePorts  bool
 }
 
 // NewHealthController returns a HealthController
-func NewHealthController(health healthcheck.Handler,
+func NewHealthController(
+	health healthcheck.Handler,
 	kubeClient kubernetes.Interface,
 	agonesClient versioned.Interface,
 	kubeInformerFactory informers.SharedInformerFactory,
-	agonesInformerFactory externalversions.SharedInformerFactory) *HealthController {
+	agonesInformerFactory externalversions.SharedInformerFactory,
+	waitOnFreePorts bool) *HealthController {
 
 	podInformer := kubeInformerFactory.Core().V1().Pods().Informer()
 	gameserverInformer := agonesInformerFactory.Agones().V1().GameServers()
@@ -71,6 +74,7 @@ func NewHealthController(health healthcheck.Handler,
 		gameServerSynced: gameserverInformer.Informer().HasSynced,
 		gameServerGetter: agonesClient.AgonesV1(),
 		gameServerLister: gameserverInformer.Lister(),
+		waitOnFreePorts:  waitOnFreePorts,
 	}
 
 	hc.baseLogger = runtime.NewLoggerWithType(hc)
@@ -82,7 +86,7 @@ func NewHealthController(health healthcheck.Handler,
 	eventBroadcaster.StartRecordingToSink(&typedcorev1.EventSinkImpl{Interface: kubeClient.CoreV1().Events("")})
 	hc.recorder = eventBroadcaster.NewRecorder(scheme.Scheme, corev1.EventSource{Component: "health-controller"})
 
-	podInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+	_, _ = podInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		UpdateFunc: func(oldObj, newObj interface{}) {
 			pod := newObj.(*corev1.Pod)
 			if isGameServerPod(pod) && hc.isUnhealthy(pod) {
@@ -109,6 +113,10 @@ func (hc *HealthController) isUnhealthy(pod *corev1.Pod) bool {
 // unschedulableWithNoFreePorts checks if the reason the Pod couldn't be scheduled
 // was because there weren't any free ports in the range specified
 func (hc *HealthController) unschedulableWithNoFreePorts(pod *corev1.Pod) bool {
+	// On some cloud products (GKE Autopilot), wait on the Autoscaler to schedule a pod with conflicting ports.
+	if hc.waitOnFreePorts {
+		return false
+	}
 	for _, cond := range pod.Status.Conditions {
 		if cond.Type == corev1.PodScheduled && cond.Reason == corev1.PodReasonUnschedulable {
 			if strings.Contains(cond.Message, "free ports") {
@@ -149,13 +157,13 @@ func (hc *HealthController) failedContainer(pod *corev1.Pod) bool {
 
 // Run processes the rate limited queue.
 // Will block until stop is closed
-func (hc *HealthController) Run(ctx context.Context) error {
+func (hc *HealthController) Run(ctx context.Context, workers int) error {
 	hc.baseLogger.Debug("Wait for cache sync")
 	if !cache.WaitForCacheSync(ctx.Done(), hc.gameServerSynced, hc.podSynced) {
 		return errors.New("failed to wait for caches to sync")
 	}
 
-	hc.workerqueue.Run(ctx, 1)
+	hc.workerqueue.Run(ctx, workers)
 
 	return nil
 }
@@ -194,7 +202,7 @@ func (hc *HealthController) syncGameServer(ctx context.Context, key string) erro
 	}
 
 	// at this point we don't care, we're already Unhealthy / deleting
-	if gs.IsBeingDeleted() || gs.Status.State == agonesv1.GameServerStateUnhealthy {
+	if gs.IsBeingDeleted() || gs.Status.State == agonesv1.GameServerStateUnhealthy || gs.Status.State == agonesv1.GameServerStateError {
 		return nil
 	}
 
@@ -214,7 +222,7 @@ func (hc *HealthController) syncGameServer(ctx context.Context, key string) erro
 			return err
 		}
 
-		// If the pod is not unhealthy anymore, go back in the queue
+		// If the pod is not unhealthy any more, go back in the queue
 		if !hc.isUnhealthy(pod) {
 			hc.baseLogger.WithField("gs", gs.ObjectMeta.Name).WithField("podStatus", pod.Status).Debug("GameServer is not unhealthy anymore")
 			return nil

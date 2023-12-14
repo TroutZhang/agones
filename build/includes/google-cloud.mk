@@ -27,10 +27,17 @@ gcloud-init: ensure-build-config
 gcloud-test-cluster: GCP_CLUSTER_NODEPOOL_INITIALNODECOUNT ?= 4
 gcloud-test-cluster: GCP_CLUSTER_NODEPOOL_MACHINETYPE ?= e2-standard-4
 gcloud-test-cluster: GCP_CLUSTER_NODEPOOL_ENABLEIMAGESTREAMING ?= true
+gcloud-test-cluster: GCP_CLUSTER_NODEPOOL_AUTOSCALE ?= false
+gcloud-test-cluster: GCP_CLUSTER_NODEPOOL_MIN_NODECOUNT ?= 1
+gcloud-test-cluster: GCP_CLUSTER_NODEPOOL_MAX_NODECOUNT ?= 5
 gcloud-test-cluster: GCP_CLUSTER_NODEPOOL_WINDOWSINITIALNODECOUNT ?= 0
 gcloud-test-cluster: GCP_CLUSTER_NODEPOOL_WINDOWSMACHINETYPE ?= e2-standard-4
 gcloud-test-cluster: $(ensure-build-image)
-	$(MAKE) gcloud-terraform-cluster GCP_TF_CLUSTER_NAME="$(GCP_CLUSTER_NAME)" GCP_CLUSTER_ZONE="$(GCP_CLUSTER_ZONE)" \
+	$(MAKE) gcloud-terraform-cluster GCP_TF_CLUSTER_NAME="$(GCP_CLUSTER_NAME)" \
+		GCP_CLUSTER_LOCATION="$(GCP_CLUSTER_LOCATION)" \
+		GCP_CLUSTER_AUTOSCALE="$(GCP_CLUSTER_NODEPOOL_AUTOSCALE)" \
+		GCP_CLUSTER_MIN_NODECOUNT="$(GCP_CLUSTER_NODEPOOL_MIN_NODECOUNT)" \
+		GCP_CLUSTER_MAX_NODECOUNT="$(GCP_CLUSTER_NODEPOOL_MAX_NODECOUNT)" \
 		GCP_CLUSTER_NODEPOOL_INITIALNODECOUNT="$(GCP_CLUSTER_NODEPOOL_INITIALNODECOUNT)" \
 		GCP_CLUSTER_NODEPOOL_MACHINETYPE="$(GCP_CLUSTER_NODEPOOL_MACHINETYPE)" \
 		GCP_CLUSTER_NODEPOOL_ENABLEIMAGESTREAMING="$(GCP_CLUSTER_NODEPOOL_ENABLEIMAGESTREAMING)" \
@@ -41,45 +48,44 @@ gcloud-test-cluster: $(ensure-build-image)
 clean-gcloud-test-cluster: $(ensure-build-image)
 	$(MAKE) gcloud-terraform-destroy-cluster
 
+gcloud-e2e-infra-state-bucket: GCP_PROJECT ?= $(shell $(current_project))
+gcloud-e2e-infra-state-bucket:
+	$(MAKE) terraform-init DIRECTORY=e2e/state-bucket
+	docker run --rm -it $(common_mounts) $(build_tag) bash -c 'cd $(mount_path)/build/terraform/e2e/state-bucket && \
+      	terraform apply -auto-approve -var project="$(GCP_PROJECT)"'
+
+ensure-e2e-infra-state-bucket: GCP_PROJECT ?= $(shell $(current_project))
+ensure-e2e-infra-state-bucket:
+	@buckets=$$(docker run --rm $(common_mounts) $(build_tag) gcloud storage buckets describe gs://$(GCP_PROJECT)-e2e-infra-bucket-tfstate --format="value(id)");\
+	if [ -z $${buckets} ]; then\
+		echo "E2E infra state bucket $(GCP_PROJECT)-e2e-infra-bucket-tfstate does not exist, creating...";\
+		$(MAKE) gcloud-e2e-infra-state-bucket;\
+	fi
+
 # Creates a gcloud cluster for end-to-end
-# it installs also a consul cluster to handle build system concurrency using a distributed lock
-gcloud-e2e-test-cluster: GCP_PROJECT ?= $(current_project)
-gcloud-e2e-test-cluster: $(ensure-build-image)
+gcloud-e2e-test-cluster: GCP_PROJECT ?= $(shell $(current_project))
+gcloud-e2e-test-cluster: $(ensure-build-image) ensure-e2e-infra-state-bucket
 gcloud-e2e-test-cluster:
-	$(MAKE) terraform-init DIRECTORY=e2e
+	$(MAKE) terraform-init BUCKET=$(GCP_PROJECT)-e2e-infra-bucket-tfstate PREFIX=terraform/state DIRECTORY=e2e
 	docker run --rm -it $(common_mounts) $(DOCKER_RUN_ARGS) $(build_tag) bash -c 'cd $(mount_path)/build/terraform/e2e && \
       	terraform apply -auto-approve -var project="$(GCP_PROJECT)"'
 
 # Deletes the gcloud e2e cluster and cleanup any left pvc volumes
+clean-gcloud-e2e-test-cluster: GCP_PROJECT ?= $(shell $(current_project))
 clean-gcloud-e2e-test-cluster: $(ensure-build-image)
 clean-gcloud-e2e-test-cluster:
-	$(MAKE) terraform-init DIRECTORY=e2e
+	$(MAKE) terraform-init BUCKET=$(GCP_PROJECT)-e2e-infra-bucket-tfstate PREFIX=terraform/state DIRECTORY=e2e
 	$(DOCKER_RUN) bash -c 'cd $(mount_path)/build/terraform/e2e && terraform destroy -var project=$(GCP_PROJECT) -auto-approve'
-
-# Creates a gcloud cluster for prow
-gcloud-prow-build-cluster: GCP_PROJECT ?= $(current_project)
-gcloud-prow-build-cluster: $(ensure-build-image)
-gcloud-prow-build-cluster:
-	$(MAKE) terraform-init DIRECTORY=prow
-	docker run --rm -it $(common_mounts) $(DOCKER_RUN_ARGS) $(build_tag) bash -c 'cd $(mount_path)/build/terraform/prow && \
-      	terraform apply -auto-approve -var project="$(GCP_PROJECT)"'
-
-# Deletes the gcloud prow build cluster
-clean-gcloud-prow-build-cluster: $(ensure-build-image)
-	$(MAKE) terraform-init DIRECTORY=prow
-	$(DOCKER_RUN) bash -c 'cd $(mount_path)/build/terraform/prow && terraform destroy -var project=$(GCP_PROJECT) -auto-approve'
 
 # Pulls down authentication information for kubectl against a cluster, name can be specified through GCP_CLUSTER_NAME
 # (defaults to 'test-cluster')
 gcloud-auth-cluster: $(ensure-build-image)
-	docker run --rm $(common_mounts) $(build_tag) gcloud config set container/cluster $(GCP_CLUSTER_NAME)
-	docker run --rm $(common_mounts) $(build_tag) gcloud config set compute/zone $(GCP_CLUSTER_ZONE)
-	docker run --rm $(common_mounts) $(build_tag) gcloud container clusters get-credentials $(GCP_CLUSTER_NAME)
+	docker run --rm $(common_mounts) $(build_tag) gcloud container clusters get-credentials $(GCP_CLUSTER_NAME) --zone  $(GCP_CLUSTER_LOCATION)
 
 # authenticate our docker configuration so that you can do a docker push directly
-# to the gcr.io repository
+# to the Google Artifact Registry repository
 gcloud-auth-docker: $(ensure-build-image)
-	docker run --rm $(common_mounts) $(build_tag) gcloud auth print-access-token | docker login -u oauth2accesstoken --password-stdin https://gcr.io
+	docker run --rm $(common_mounts) $(build_tag) gcloud auth print-access-token | docker login -u oauth2accesstoken --password-stdin https://us-docker.pkg.dev
 
 # Clean the gcloud configuration
 clean-gcloud-config:

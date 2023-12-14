@@ -22,17 +22,33 @@ data "google_client_config" "default" {}
 # A list of all parameters used in interpolation var.cluster
 # Set values to default if not key was not set in original map
 locals {
-  project                 = lookup(var.cluster, "project", "agones")
-  zone                    = lookup(var.cluster, "zone", "us-west1-c")
-  name                    = lookup(var.cluster, "name", "test-cluster")
-  machineType             = lookup(var.cluster, "machineType", "e2-standard-4")
-  initialNodeCount        = lookup(var.cluster, "initialNodeCount", "4")
-  enableImageStreaming    = lookup(var.cluster, "enableImageStreaming", true)
-  network                 = lookup(var.cluster, "network", "default")
-  subnetwork              = lookup(var.cluster, "subnetwork", "")
-  kubernetesVersion       = lookup(var.cluster, "kubernetesVersion", "1.23")
-  windowsInitialNodeCount = lookup(var.cluster, "windowsInitialNodeCount", "0")
-  windowsMachineType      = lookup(var.cluster, "windowsMachineType", "e2-standard-4")
+  project                       = lookup(var.cluster, "project", "agones")
+  location                      = lookup(var.cluster, "location", "us-west1-c")
+  zone                          = lookup(var.cluster, "zone", "")
+  name                          = lookup(var.cluster, "name", "test-cluster")
+  machineType                   = lookup(var.cluster, "machineType", "e2-standard-4")
+  initialNodeCount              = lookup(var.cluster, "initialNodeCount", "4")
+  enableImageStreaming          = lookup(var.cluster, "enableImageStreaming", true)
+  network                       = lookup(var.cluster, "network", "default")
+  subnetwork                    = lookup(var.cluster, "subnetwork", "")
+  releaseChannel                = lookup(var.cluster, "releaseChannel", "UNSPECIFIED")
+  kubernetesVersion             = lookup(var.cluster, "kubernetesVersion", "1.27")
+  windowsInitialNodeCount       = lookup(var.cluster, "windowsInitialNodeCount", "0")
+  windowsMachineType            = lookup(var.cluster, "windowsMachineType", "e2-standard-4")
+  autoscale                     = lookup(var.cluster, "autoscale", false)
+  workloadIdentity              = lookup(var.cluster, "workloadIdentity", false)
+  minNodeCount                  = lookup(var.cluster, "minNodeCount", "1")
+  maxNodeCount                  = lookup(var.cluster, "maxNodeCount", "5")
+  maintenanceExclusionStartTime = lookup(var.cluster, "maintenanceExclusionStartTime", timestamp())
+  maintenanceExclusionEndTime   = lookup(var.cluster, "maintenanceExclusionEndTime", timeadd(timestamp(), "2640h"))
+  # 110 days
+}
+
+data "google_container_engine_versions" "version" {
+  project        = local.project
+  provider       = google-beta
+  location       = local.location
+  version_prefix = format("%s.", local.kubernetesVersion)
 }
 
 # echo command used for debugging purpose
@@ -40,15 +56,18 @@ locals {
 resource "null_resource" "test-setting-variables" {
   provisioner "local-exec" {
     command = <<EOT
-    ${format("echo Current variables set as following - name: %s, project: %s, machineType: %s, initialNodeCount: %s, network: %s, zone: %s, windowsInitialNodeCount: %s, windowsMachineType: %s",
+    ${format("echo Current variables set as following - name: %s, project: %s, machineType: %s, initialNodeCount: %s, network: %s, zone: %s, location: %s, windowsInitialNodeCount: %s, windowsMachineType: %s, releaseChannel: %s, kubernetesVersion: %s",
     local.name,
     local.project,
     local.machineType,
     local.initialNodeCount,
     local.network,
     local.zone,
+    local.location,
     local.windowsInitialNodeCount,
     local.windowsMachineType,
+    local.releaseChannel,
+    local.kubernetesVersion,
 )}
     EOT
 }
@@ -56,20 +75,53 @@ resource "null_resource" "test-setting-variables" {
 
 resource "google_container_cluster" "primary" {
   name       = local.name
-  location   = local.zone
+  location   = local.zone != "" ? local.zone : local.location
   project    = local.project
   network    = local.network
   subnetwork = local.subnetwork
 
+  networking_mode = "VPC_NATIVE"
+  ip_allocation_policy {}
+  
+  release_channel {
+    channel = local.releaseChannel
+  }
+
   min_master_version = local.kubernetesVersion
+
+  dynamic "maintenance_policy" {
+    for_each = local.releaseChannel != "UNSPECIFIED" ? [1] : []
+    content {
+      # When exclusions and maintenance windows overlap, exclusions have precedence.
+      daily_maintenance_window {
+        start_time = "03:00"
+      }
+      maintenance_exclusion {
+        exclusion_name = format("%s-%s", local.name, "exclusion")
+        start_time     = local.maintenanceExclusionStartTime
+        end_time       = local.maintenanceExclusionEndTime
+        exclusion_options {
+          scope = "NO_MINOR_UPGRADES"
+        }
+      }
+    }
+  }
 
   node_pool {
     name       = "default"
-    node_count = local.initialNodeCount
-    version    = local.kubernetesVersion
+    node_count = local.autoscale ? null : local.initialNodeCount
+    version    = local.releaseChannel == "UNSPECIFIED" ? data.google_container_engine_versions.version.latest_node_version : data.google_container_engine_versions.version.release_channel_latest_version[local.releaseChannel]
+
+    dynamic "autoscaling" {
+      for_each = local.autoscale ? [1] : []
+      content {
+        min_node_count = local.minNodeCount
+        max_node_count = local.maxNodeCount
+      }
+    }
 
     management {
-      auto_upgrade = false
+      auto_upgrade = local.releaseChannel == "UNSPECIFIED" ? false : true
     }
 
     node_config {
@@ -94,10 +146,10 @@ resource "google_container_cluster" "primary" {
   node_pool {
     name       = "agones-system"
     node_count = 1
-    version    = local.kubernetesVersion
+    version    = local.releaseChannel == "UNSPECIFIED" ? data.google_container_engine_versions.version.latest_node_version : data.google_container_engine_versions.version.release_channel_latest_version[local.releaseChannel]
 
     management {
-      auto_upgrade = false
+      auto_upgrade = local.releaseChannel == "UNSPECIFIED" ? false : true
     }
 
     node_config {
@@ -130,10 +182,10 @@ resource "google_container_cluster" "primary" {
   node_pool {
     name       = "agones-metrics"
     node_count = 1
-    version    = local.kubernetesVersion
+    version    = local.releaseChannel == "UNSPECIFIED" ? data.google_container_engine_versions.version.latest_node_version : data.google_container_engine_versions.version.release_channel_latest_version[local.releaseChannel]
 
     management {
-      auto_upgrade = false
+      auto_upgrade = local.releaseChannel == "UNSPECIFIED" ? false : true
     }
 
     node_config {
@@ -176,14 +228,14 @@ resource "google_container_cluster" "primary" {
     content {
       name       = "windows"
       node_count = local.windowsInitialNodeCount
-      version    = local.kubernetesVersion
+      version    = local.releaseChannel == "UNSPECIFIED" ? data.google_container_engine_versions.version.latest_node_version : data.google_container_engine_versions.version.release_channel_latest_version[local.releaseChannel]
 
       management {
-        auto_upgrade = false
+        auto_upgrade = local.releaseChannel == "UNSPECIFIED" ? false : true
       }
 
       node_config {
-        image_type   = "WINDOWS_LTSC"
+        image_type   = "WINDOWS_LTSC_CONTAINERD"
         machine_type = local.windowsMachineType
 
         oauth_scopes = [
@@ -199,6 +251,12 @@ resource "google_container_cluster" "primary" {
       }
     }
   }
+  dynamic "workload_identity_config" {
+    for_each = local.workloadIdentity ? [1] : []
+    content {
+      workload_pool = "${local.project}.svc.id.goog"
+    }
+  }
   timeouts {
     create = "30m"
     update = "40m"
@@ -206,6 +264,7 @@ resource "google_container_cluster" "primary" {
 }
 
 resource "google_compute_firewall" "default" {
+  count   = var.udpFirewall ? 1 : 0
   name    = length(var.firewallName) == 0 ? "game-server-firewall-${local.name}" : var.firewallName
   project = local.project
   network = local.network
@@ -215,6 +274,6 @@ resource "google_compute_firewall" "default" {
     ports    = [var.ports]
   }
 
-  target_tags = ["game-server"]
+  target_tags   = ["game-server"]
   source_ranges = [var.sourceRanges]
 }

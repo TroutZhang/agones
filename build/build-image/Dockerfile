@@ -23,7 +23,7 @@ RUN apt-get update && \
 
 # install go
 WORKDIR /usr/local
-ENV GO_VERSION=1.19.1
+ENV GO_VERSION=1.20.10
 ENV GOPATH /go
 ENV GO111MODULE=on
 RUN wget -q https://dl.google.com/go/go${GO_VERSION}.linux-amd64.tar.gz && \
@@ -44,7 +44,7 @@ ENV PATH /usr/local/go/bin:/go/bin:$PATH
 RUN go install golang.org/x/tools/cmd/goimports@latest
 
 # the kubernetes version for the file
-ENV KUBERNETES_VER 1.23.9
+ENV KUBERNETES_VER 1.27.6
 
 # overwrite kubectl as we want a specific version
 RUN curl -LO https://storage.googleapis.com/kubernetes-release/release/v${KUBERNETES_VER}/bin/linux/amd64/kubectl && \
@@ -57,7 +57,7 @@ RUN mkdir -p /go/src/k8s.io && cd /go/src/k8s.io && \
     git clone -b kubernetes-${KUBERNETES_VER} --depth=3 https://github.com/kubernetes/code-generator.git
 
 # install Helm package manager
-ENV HELM_VER 3.5.0
+ENV HELM_VER 3.10.3
 ENV HELM_URL https://get.helm.sh/helm-v${HELM_VER}-linux-amd64.tar.gz
 RUN curl -L  ${HELM_URL} > /tmp/helm.tar.gz \
     && tar -zxvf /tmp/helm.tar.gz -C /tmp \
@@ -67,7 +67,15 @@ RUN curl -L  ${HELM_URL} > /tmp/helm.tar.gz \
 RUN echo "source <(helm completion bash)" >> /root/.bashrc
 
 # install golang-ci linter
-RUN go install github.com/golangci/golangci-lint/cmd/golangci-lint@v1.49.0
+RUN go install github.com/golangci/golangci-lint/cmd/golangci-lint@v1.51.2
+
+# Install Python, pip, and yamllint
+RUN apt-get update && \
+    apt-get install -y python3-pip && \
+    pip3 install yamllint==1.32.0
+
+# install gotestsum test runner
+RUN go install gotest.tools/gotestsum@latest
 
 #
 #  \ \      / /__| |__  ___(_) |_ ___
@@ -76,27 +84,24 @@ RUN go install github.com/golangci/golangci-lint/cmd/golangci-lint@v1.49.0
 #     \_/\_/ \___|_.__/|___/_|\__\___|
 #
 
-ENV HUGO_VER 0.82.1
+ENV HUGO_VER 0.118.2
 RUN mkdir /tmp/hugo && \
     wget -q -O /tmp/hugo/hugo.tar.gz https://github.com/gohugoio/hugo/releases/download/v${HUGO_VER}/hugo_extended_${HUGO_VER}_Linux-64bit.tar.gz && \
     tar -zxvf /tmp/hugo/hugo.tar.gz -C /tmp/hugo/ && \
     mv /tmp/hugo/hugo /usr/local/bin/ && \
     rm -r /tmp/hugo
 
-RUN add-apt-repository -y -r ppa:chris-lea/node.js
-RUN rm -f /etc/apt/sources.list.d/chris-lea-node_js-*.list
-RUN rm -f /etc/apt/sources.list.d/chris-lea-node_js-*.list.save
+# Import the Nodesource GPG key
+RUN apt-get update && \
+    apt-get install -y ca-certificates curl gnupg && \
+    mkdir -p /etc/apt/keyrings && \
+    curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg
 
-ARG KEYRING=/usr/share/keyrings/nodesource.gpg
-ARG VERSION=node_16.x
+# Create deb repository for a specific Node major version
+ARG NODE_MAJOR=20
+RUN echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_$NODE_MAJOR.x nodistro main" > /etc/apt/sources.list.d/nodesource.list
 
-RUN curl -fsSL https://deb.nodesource.com/gpgkey/nodesource.gpg.key | gpg --dearmor | tee "$KEYRING" >/dev/null
-RUN gpg --no-default-keyring --keyring "$KEYRING" --list-keys
-
-ARG DISTRO="buster"
-RUN echo "deb [signed-by=$KEYRING] https://deb.nodesource.com/$VERSION $DISTRO main" | tee /etc/apt/sources.list.d/nodesource.list
-RUN echo "deb-src [signed-by=$KEYRING] https://deb.nodesource.com/$VERSION $DISTRO main" | tee -a /etc/apt/sources.list.d/nodesource.list
-
+# Update and install Node.js
 RUN apt-get update && apt-get install -y nodejs
 
 # install API reference docs generator
@@ -117,7 +122,7 @@ RUN echo "export PATH=/usr/local/go/bin:/go/bin/:\$PATH" >> /root/.bashrc
 RUN echo "export EDITOR=nano" >> /root/.bashrc
 
 # install terraform
-RUN wget -nv -O terraform.zip https://releases.hashicorp.com/terraform/1.0.8/terraform_1.0.8_linux_amd64.zip && unzip ./terraform.zip && mv terraform /usr/local/bin/
+RUN wget -nv -O terraform.zip https://releases.hashicorp.com/terraform/1.5.4/terraform_1.5.4_linux_amd64.zip && unzip ./terraform.zip && mv terraform /usr/local/bin/
 
 # code generation scripts
 COPY *.sh /root/

@@ -31,6 +31,7 @@ import (
 	"agones.dev/agones/pkg/util/runtime"
 	"agones.dev/agones/pkg/util/webhooks"
 	"agones.dev/agones/pkg/util/workerqueue"
+	"github.com/google/go-cmp/cmp"
 	"github.com/heptiolabs/healthcheck"
 	"github.com/mattbaird/jsonpatch"
 	"github.com/pkg/errors"
@@ -43,6 +44,7 @@ import (
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	runtimeschema "k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
@@ -51,6 +53,12 @@ import (
 	"k8s.io/client-go/tools/record"
 	"k8s.io/utils/integer"
 )
+
+// Extensions struct contains what is needed to bind webhook handlers
+type Extensions struct {
+	baseLogger *logrus.Entry
+	apiHooks   agonesv1.APIHooks
+}
 
 // Controller is a the GameServerSet controller
 type Controller struct {
@@ -68,7 +76,6 @@ type Controller struct {
 
 // NewController returns a new fleets crd controller
 func NewController(
-	wh *webhooks.WebHook,
 	health healthcheck.Handler,
 	kubeClient kubernetes.Interface,
 	extClient extclientset.Interface,
@@ -100,18 +107,14 @@ func NewController(
 	eventBroadcaster.StartRecordingToSink(&typedcorev1.EventSinkImpl{Interface: kubeClient.CoreV1().Events("")})
 	c.recorder = eventBroadcaster.NewRecorder(scheme.Scheme, corev1.EventSource{Component: "fleet-controller"})
 
-	wh.AddHandler("/mutate", agonesv1.Kind("Fleet"), admissionv1.Create, c.creationMutationHandler)
-	wh.AddHandler("/validate", agonesv1.Kind("Fleet"), admissionv1.Create, c.creationValidationHandler)
-	wh.AddHandler("/validate", agonesv1.Kind("Fleet"), admissionv1.Update, c.creationValidationHandler)
-
-	fInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+	_, _ = fInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: c.workerqueue.Enqueue,
 		UpdateFunc: func(_, newObj interface{}) {
 			c.workerqueue.Enqueue(newObj)
 		},
 	})
 
-	gsSetInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+	_, _ = gsSetInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: c.gameServerSetEventHandler,
 		UpdateFunc: func(_, newObj interface{}) {
 			gsSet := newObj.(*agonesv1.GameServerSet)
@@ -125,18 +128,34 @@ func NewController(
 	return c
 }
 
+// NewExtensions binds the handlers to the webhook outside the initialization of the controller
+// initializes a new logger for extensions.
+func NewExtensions(apiHooks agonesv1.APIHooks, wh *webhooks.WebHook) *Extensions {
+	ext := &Extensions{apiHooks: apiHooks}
+
+	ext.baseLogger = runtime.NewLoggerWithType(ext)
+
+	wh.AddHandler("/mutate", agonesv1.Kind("Fleet"), admissionv1.Create, ext.creationMutationHandler)
+	wh.AddHandler("/validate", agonesv1.Kind("Fleet"), admissionv1.Create, ext.creationValidationHandler)
+	wh.AddHandler("/validate", agonesv1.Kind("Fleet"), admissionv1.Update, ext.creationValidationHandler)
+
+	return ext
+}
+
 // creationMutationHandler is the handler for the mutating webhook that sets the
 // the default values on the Fleet
 // Should only be called on fleet create operations.
 // nolint:dupl
-func (c *Controller) creationMutationHandler(review admissionv1.AdmissionReview) (admissionv1.AdmissionReview, error) {
-	c.baseLogger.WithField("review", review).Debug("creationMutationHandler")
+func (ext *Extensions) creationMutationHandler(review admissionv1.AdmissionReview) (admissionv1.AdmissionReview, error) {
+	ext.baseLogger.WithField("review", review).Debug("creationMutationHandler")
 
 	obj := review.Request.Object
 	fleet := &agonesv1.Fleet{}
 	err := json.Unmarshal(obj.Raw, fleet)
 	if err != nil {
-		return review, errors.Wrapf(err, "error unmarshalling original Fleet json: %s", obj.Raw)
+		// If the JSON is invalid during mutation, fall through to validation. This allows OpenAPI schema validation
+		// to proceed, resulting in a more user friendly error message.
+		return review, nil
 	}
 
 	// This is the main logic of this function
@@ -158,7 +177,7 @@ func (c *Controller) creationMutationHandler(review admissionv1.AdmissionReview)
 		return review, errors.Wrapf(err, "error creating json for patch for Fleet %s", fleet.ObjectMeta.Name)
 	}
 
-	c.loggerForFleet(fleet).WithField("patch", string(jsn)).Debug("patch created!")
+	loggerForFleet(fleet, ext.baseLogger).WithField("patch", string(jsn)).Debug("patch created!")
 
 	pt := admissionv1.PatchTypeJSONPatch
 	review.Response.PatchType = &pt
@@ -169,34 +188,25 @@ func (c *Controller) creationMutationHandler(review admissionv1.AdmissionReview)
 
 // creationValidationHandler that validates a Fleet when it is created
 // Should only be called on Fleet create and Update operations.
-func (c *Controller) creationValidationHandler(review admissionv1.AdmissionReview) (admissionv1.AdmissionReview, error) {
-	c.baseLogger.WithField("review", review).Debug("creationValidationHandler")
+func (ext *Extensions) creationValidationHandler(review admissionv1.AdmissionReview) (admissionv1.AdmissionReview, error) {
+	ext.baseLogger.WithField("review", review).Debug("creationValidationHandler")
 
 	obj := review.Request.Object
 	fleet := &agonesv1.Fleet{}
 	err := json.Unmarshal(obj.Raw, fleet)
 	if err != nil {
-		return review, errors.Wrapf(err, "error unmarshalling original Fleet json: %s", obj.Raw)
+		return review, errors.Wrapf(err, "error unmarshalling Fleet json after schema validation: %s", obj.Raw)
 	}
 
-	causes, ok := fleet.Validate()
-	if !ok {
+	if errs := fleet.Validate(ext.apiHooks); len(errs) > 0 {
+		kind := runtimeschema.GroupKind{
+			Group: review.Request.Kind.Group,
+			Kind:  review.Request.Kind.Kind,
+		}
+		statusErr := k8serrors.NewInvalid(kind, review.Request.Name, errs)
 		review.Response.Allowed = false
-		details := metav1.StatusDetails{
-			Name:   review.Request.Name,
-			Group:  review.Request.Kind.Group,
-			Kind:   review.Request.Kind.Kind,
-			Causes: causes,
-		}
-		review.Response.Result = &metav1.Status{
-			Status:  metav1.StatusFailure,
-			Message: "Fleet configuration is invalid",
-			Reason:  metav1.StatusReasonInvalid,
-			Details: &details,
-		}
-
-		c.loggerForFleet(fleet).WithField("review", review).Warn("Invalid Fleet")
-		return review, nil
+		review.Response.Result = &statusErr.ErrStatus
+		loggerForFleet(fleet, ext.baseLogger).WithField("review", review).Debug("Invalid Fleet")
 	}
 
 	return review, nil
@@ -219,16 +229,16 @@ func (c *Controller) Run(ctx context.Context, workers int) error {
 	return nil
 }
 
-func (c *Controller) loggerForFleetKey(key string) *logrus.Entry {
-	return logfields.AugmentLogEntry(c.baseLogger, logfields.FleetKey, key)
+func loggerForFleetKey(key string, logger *logrus.Entry) *logrus.Entry {
+	return logfields.AugmentLogEntry(logger, logfields.FleetKey, key)
 }
 
-func (c *Controller) loggerForFleet(f *agonesv1.Fleet) *logrus.Entry {
+func loggerForFleet(f *agonesv1.Fleet, logger *logrus.Entry) *logrus.Entry {
 	fleetName := "NilFleet"
 	if f != nil {
 		fleetName = f.ObjectMeta.Namespace + "/" + f.ObjectMeta.Name
 	}
-	return c.loggerForFleetKey(fleetName).WithField("fleet", f)
+	return loggerForFleetKey(fleetName, logger).WithField("fleet", f)
 }
 
 // gameServerSetEventHandler enqueues the owning Fleet for this GameServerSet,
@@ -245,7 +255,7 @@ func (c *Controller) gameServerSetEventHandler(obj interface{}) {
 		if k8serrors.IsNotFound(err) {
 			c.baseLogger.WithField("ref", ref).Warn("Owner Fleet no longer available for syncing")
 		} else {
-			runtime.HandleError(c.loggerForFleet(fleet).WithField("ref", ref),
+			runtime.HandleError(loggerForFleet(fleet, c.baseLogger).WithField("ref", ref),
 				errors.Wrap(err, "error retrieving GameServerSet owner"))
 		}
 		return
@@ -256,20 +266,20 @@ func (c *Controller) gameServerSetEventHandler(obj interface{}) {
 // syncFleet synchronised the fleet CRDs and configures/updates
 // backing GameServerSets
 func (c *Controller) syncFleet(ctx context.Context, key string) error {
-	c.loggerForFleetKey(key).Debug("Synchronising")
+	loggerForFleetKey(key, c.baseLogger).Debug("Synchronising")
 
 	// Convert the namespace/name string into a distinct namespace and name
 	namespace, name, err := cache.SplitMetaNamespaceKey(key)
 	if err != nil {
 		// don't return an error, as we don't want this retried
-		runtime.HandleError(c.loggerForFleetKey(key), errors.Wrapf(err, "invalid resource key"))
+		runtime.HandleError(loggerForFleetKey(key, c.baseLogger), errors.Wrapf(err, "invalid resource key"))
 		return nil
 	}
 
 	fleet, err := c.fleetLister.Fleets(namespace).Get(name)
 	if err != nil {
 		if k8serrors.IsNotFound(err) {
-			c.loggerForFleetKey(key).Debug("Fleet is no longer available for syncing")
+			loggerForFleetKey(key, c.baseLogger).Debug("Fleet is no longer available for syncing")
 			return nil
 		}
 		return errors.Wrapf(err, "error retrieving fleet %s from namespace %s", name, namespace)
@@ -289,7 +299,7 @@ func (c *Controller) syncFleet(ctx context.Context, key string) error {
 
 	// if there isn't an active gameServerSet, create one (but don't persist yet)
 	if active == nil {
-		c.loggerForFleet(fleet).Debug("could not find active GameServerSet, creating")
+		loggerForFleet(fleet, c.baseLogger).Debug("could not find active GameServerSet, creating")
 		active = fleet.GameServerSet()
 	}
 
@@ -348,17 +358,42 @@ func (c *Controller) upsertGameServerSet(ctx context.Context, fleet *agonesv1.Fl
 			"Scaling active GameServerSet %s from %d to %d", gsSetCopy.ObjectMeta.Name, active.Spec.Replicas, gsSetCopy.Spec.Replicas)
 	}
 
+	// Update GameServerSet Counts and Lists Priorities if not equal to the Priorities on the Fleet
+	if runtime.FeatureEnabled(runtime.FeatureCountsAndLists) {
+		if !cmp.Equal(active.Spec.Priorities, fleet.Spec.Priorities) {
+			gsSetCopy := active.DeepCopy()
+			gsSetCopy.Spec.Priorities = fleet.Spec.Priorities
+			_, err := c.gameServerSetGetter.GameServerSets(fleet.ObjectMeta.Namespace).Update(ctx, gsSetCopy, metav1.UpdateOptions{})
+			if err != nil {
+				return errors.Wrapf(err, "error updating priorities for gameserverset for fleet %s", fleet.ObjectMeta.Name)
+			}
+			c.recorder.Eventf(fleet, corev1.EventTypeNormal, "UpdatingGameServerSet",
+				"Updated GameServerSet %s Priorities", gsSetCopy.ObjectMeta.Name)
+		}
+	}
+
 	return nil
 }
 
 // applyDeploymentStrategy applies the Fleet > Spec > Deployment strategy to all the non-active
 // GameServerSets that are passed in
 func (c *Controller) applyDeploymentStrategy(ctx context.Context, fleet *agonesv1.Fleet, active *agonesv1.GameServerSet, rest []*agonesv1.GameServerSet) (int32, error) {
-	// if there is nothing `rest`, then it's either brand Fleet, or we can just jump to the fleet value,
+	// if there is nothing `rest`, then it's either a brand-new Fleet, or we can just jump to the fleet value,
 	// since there is nothing else scaling down at this point
-
 	if len(rest) == 0 {
 		return fleet.Spec.Replicas, nil
+	}
+
+	// if we do have `rest` but all their spec.replicas is zero, we can just do subtraction against whatever is allocated in `rest`.
+	if agonesv1.SumSpecReplicas(rest) == 0 {
+		blocked := agonesv1.SumGameServerSets(rest, func(gsSet *agonesv1.GameServerSet) int32 {
+			return gsSet.Status.ReservedReplicas + gsSet.Status.AllocatedReplicas
+		})
+		replicas := fleet.Spec.Replicas - blocked
+		if replicas < 0 {
+			replicas = 0
+		}
+		return replicas, nil
 	}
 
 	switch fleet.Spec.Strategy.Type {
@@ -396,7 +431,7 @@ func (c *Controller) recreateDeployment(ctx context.Context, fleet *agonesv1.Fle
 		if gsSet.Spec.Replicas == 0 {
 			continue
 		}
-		c.loggerForFleet(fleet).WithField("gameserverset", gsSet.ObjectMeta.Name).Debug("applying recreate deployment: scaling to 0")
+		loggerForFleet(fleet, c.baseLogger).WithField("gameserverset", gsSet.ObjectMeta.Name).Debug("applying recreate deployment: scaling to 0")
 		gsSetCopy := gsSet.DeepCopy()
 		gsSetCopy.Spec.Replicas = 0
 		if _, err := c.gameServerSetGetter.GameServerSets(gsSetCopy.ObjectMeta.Namespace).Update(ctx, gsSetCopy, metav1.UpdateOptions{}); err != nil {
@@ -467,7 +502,7 @@ func (c *Controller) rollingUpdateActive(fleet *agonesv1.Fleet, active *agonesv1
 		replicas = fleet.LowerBoundReplicas(fleet.Spec.Replicas - sumAllocated)
 	}
 
-	c.loggerForFleet(fleet).WithField("gameserverset", active.ObjectMeta.Name).WithField("replicas", replicas).
+	loggerForFleet(fleet, c.baseLogger).WithField("gameserverset", active.ObjectMeta.Name).WithField("replicas", replicas).
 		Debug("applying rolling update to active gameserverset")
 
 	return replicas, nil
@@ -548,7 +583,7 @@ func (c *Controller) rollingUpdateRestFixedOnReady(ctx context.Context, fleet *a
 	}
 	rest, _, err = c.cleanupUnhealthyReplicas(ctx, rest, fleet, maxScaledDown)
 	if err != nil {
-		c.loggerForFleet(fleet).WithField("fleet", fleet.ObjectMeta.Name).WithField("maxScaledDown", maxScaledDown).
+		loggerForFleet(fleet, c.baseLogger).WithField("fleet", fleet.ObjectMeta.Name).WithField("maxScaledDown", maxScaledDown).
 			Debug("Can not cleanup Unhealth Replicas")
 		// There could be the case when GameServerSet would be updated from another place, say Status or Spec would be updated
 		// We don't want to propagate such errors further
@@ -598,7 +633,7 @@ func (c *Controller) rollingUpdateRestFixedOnReady(ctx context.Context, fleet *a
 			}
 
 			gsSetCopy.Spec.Replicas = newReplicasCount
-			c.loggerForFleet(fleet).WithField("gameserverset", gsSet.ObjectMeta.Name).WithField("replicas", gsSetCopy.Spec.Replicas).
+			loggerForFleet(fleet, c.baseLogger).WithField("gameserverset", gsSet.ObjectMeta.Name).WithField("replicas", gsSetCopy.Spec.Replicas).
 				Debug("applying rolling update to inactive gameserverset")
 
 			if _, err := c.gameServerSetGetter.GameServerSets(gsSetCopy.ObjectMeta.Namespace).Update(ctx, gsSetCopy, metav1.UpdateOptions{}); err != nil {
@@ -621,7 +656,7 @@ func (c *Controller) rollingUpdateRest(ctx context.Context, fleet *agonesv1.Flee
 // updateFleetStatus gets the GameServerSets for this Fleet and then
 // calculates the counts for the status, and updates the Fleet
 func (c *Controller) updateFleetStatus(ctx context.Context, fleet *agonesv1.Fleet) error {
-	c.loggerForFleet(fleet).Debug("Update Fleet Status")
+	loggerForFleet(fleet, c.baseLogger).Debug("Update Fleet Status")
 
 	list, err := ListGameServerSetsByFleetOwner(c.gameServerSetLister, fleet)
 	if err != nil {
@@ -636,12 +671,20 @@ func (c *Controller) updateFleetStatus(ctx context.Context, fleet *agonesv1.Flee
 	fCopy.Status.ReadyReplicas = 0
 	fCopy.Status.ReservedReplicas = 0
 	fCopy.Status.AllocatedReplicas = 0
+	if runtime.FeatureEnabled(runtime.FeatureCountsAndLists) {
+		fCopy.Status.Counters = make(map[string]agonesv1.AggregatedCounterStatus)
+		fCopy.Status.Lists = make(map[string]agonesv1.AggregatedListStatus)
+	}
 
 	for _, gsSet := range list {
 		fCopy.Status.Replicas += gsSet.Status.Replicas
 		fCopy.Status.ReadyReplicas += gsSet.Status.ReadyReplicas
 		fCopy.Status.ReservedReplicas += gsSet.Status.ReservedReplicas
 		fCopy.Status.AllocatedReplicas += gsSet.Status.AllocatedReplicas
+		if runtime.FeatureEnabled(runtime.FeatureCountsAndLists) {
+			fCopy.Status.Counters = mergeCounters(fCopy.Status.Counters, gsSet.Status.Counters)
+			fCopy.Status.Lists = mergeLists(fCopy.Status.Lists, gsSet.Status.Lists)
+		}
 	}
 	if runtime.FeatureEnabled(runtime.FeaturePlayerTracking) {
 		// to make this code simpler, while the feature gate is in place,
@@ -676,4 +719,48 @@ func (c *Controller) filterGameServerSetByActive(fleet *agonesv1.Fleet, list []*
 	}
 
 	return active, rest
+}
+
+// mergeCounters adds the contents of AggregatedCounterStatus c2 into c1.
+func mergeCounters(c1, c2 map[string]agonesv1.AggregatedCounterStatus) map[string]agonesv1.AggregatedCounterStatus {
+	if c1 == nil {
+		c1 = make(map[string]agonesv1.AggregatedCounterStatus)
+	}
+
+	for key, val := range c2 {
+		// If the Counter exists in both maps, aggregate the values.
+		if counter, ok := c1[key]; ok {
+			counter.AllocatedCapacity += val.AllocatedCapacity
+			counter.AllocatedCount += val.AllocatedCount
+			counter.Capacity += val.Capacity
+			counter.Count += val.Count
+			c1[key] = counter
+		} else {
+			c1[key] = *val.DeepCopy()
+		}
+	}
+
+	return c1
+}
+
+// mergeLists adds the contents of AggregatedListStatus l2 into l1.
+func mergeLists(l1, l2 map[string]agonesv1.AggregatedListStatus) map[string]agonesv1.AggregatedListStatus {
+	if l1 == nil {
+		l1 = make(map[string]agonesv1.AggregatedListStatus)
+	}
+
+	for key, val := range l2 {
+		// If the List exists in both maps, aggregate the values.
+		if list, ok := l1[key]; ok {
+			list.AllocatedCapacity += val.AllocatedCapacity
+			list.AllocatedCount += val.AllocatedCount
+			list.Capacity += val.Capacity
+			list.Count += val.Count
+			l1[key] = list
+		} else {
+			l1[key] = *val.DeepCopy()
+		}
+	}
+
+	return l1
 }

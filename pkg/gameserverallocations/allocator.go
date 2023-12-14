@@ -18,13 +18,14 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	goErrors "errors"
 	"fmt"
-	"net/http"
 	"strings"
 	"time"
 
 	"agones.dev/agones/pkg/allocation/converters"
 	pb "agones.dev/agones/pkg/allocation/go"
+	"agones.dev/agones/pkg/apis"
 	agonesv1 "agones.dev/agones/pkg/apis/agones/v1"
 	allocationv1 "agones.dev/agones/pkg/apis/allocation/v1"
 	multiclusterv1 "agones.dev/agones/pkg/apis/multicluster/v1"
@@ -47,6 +48,7 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	k8sruntime "k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	runtimeschema "k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/wait"
 	informercorev1 "k8s.io/client-go/informers/core/v1"
 	"k8s.io/client-go/kubernetes"
@@ -78,6 +80,7 @@ const (
 	allocatorPort         = "443"
 	maxBatchQueue         = 100
 	maxBatchBeforeRefresh = 100
+	localAllocationSource = "local"
 )
 
 var allocationRetry = wait.Backoff{
@@ -197,26 +200,20 @@ func (c *Allocator) Allocate(ctx context.Context, gsa *allocationv1.GameServerAl
 	latency.setRequest(gsa)
 
 	// server side validation
-	if causes, ok := gsa.Validate(); !ok {
-		s := &metav1.Status{
-			Status:  metav1.StatusFailure,
-			Message: fmt.Sprintf("GameServerAllocation is invalid: Invalid value: %#v", gsa),
-			Reason:  metav1.StatusReasonInvalid,
-			Details: &metav1.StatusDetails{
-				Kind:   "GameServerAllocation",
-				Group:  allocationv1.SchemeGroupVersion.Group,
-				Causes: causes,
-			},
-			Code: http.StatusUnprocessableEntity,
+	if errs := gsa.Validate(); len(errs) > 0 {
+		kind := runtimeschema.GroupKind{
+			Group: allocationv1.SchemeGroupVersion.Group,
+			Kind:  "GameServerAllocation",
 		}
-
+		statusErr := k8serrors.NewInvalid(kind, gsa.Name, errs)
+		s := &statusErr.ErrStatus
 		var gvks []schema.GroupVersionKind
 		gvks, _, err := apiserver.Scheme.ObjectKinds(s)
 		if err != nil {
 			return nil, errors.Wrap(err, "could not find objectkinds for status")
 		}
-		c.loggerForGameServerAllocation(gsa).Debug("GameServerAllocation is invalid")
 
+		c.loggerForGameServerAllocation(gsa).Debug("GameServerAllocation is invalid")
 		s.TypeMeta = metav1.TypeMeta{Kind: gvks[0].Kind, APIVersion: gvks[0].Version}
 		return s, nil
 	}
@@ -280,7 +277,13 @@ func (c *Allocator) allocateFromLocalCluster(ctx context.Context, gsa *allocatio
 		gsa.Status.GameServerName = gs.ObjectMeta.Name
 		gsa.Status.Ports = gs.Status.Ports
 		gsa.Status.Address = gs.Status.Address
+		gsa.Status.Addresses = append(gsa.Status.Addresses, gs.Status.Addresses...)
 		gsa.Status.NodeName = gs.Status.NodeName
+		gsa.Status.Source = localAllocationSource
+		gsa.Status.Metadata = &allocationv1.GameServerMetadata{
+			Labels:      gs.ObjectMeta.Labels,
+			Annotations: gs.ObjectMeta.Annotations,
+		}
 	}
 
 	c.loggerForGameServerAllocation(gsa).Debug("Game server allocation")
@@ -356,6 +359,7 @@ func (c *Allocator) allocateFromRemoteCluster(gsa *allocationv1.GameServerAlloca
 	ctx, cancel := context.WithTimeout(context.Background(), c.totalRemoteAllocationTimeout)
 	defer cancel() // nolint: errcheck
 	// Retry on remote call failures.
+	var endpoint string
 	err = Retry(remoteAllocationRetry, func() error {
 		for i, ip := range connectionInfo.AllocationEndpoints {
 			select {
@@ -363,7 +367,7 @@ func (c *Allocator) allocateFromRemoteCluster(gsa *allocationv1.GameServerAlloca
 				return ErrTotalTimeoutExceeded
 			default:
 			}
-			endpoint := addPort(ip)
+			endpoint = addPort(ip)
 			c.loggerForGameServerAllocationKey("remote-allocation").WithField("request", request).WithField("endpoint", endpoint).Debug("forwarding allocation request")
 			allocationResponse, err = c.remoteAllocationCallback(ctx, endpoint, dialOpts, request)
 			if err != nil {
@@ -383,7 +387,7 @@ func (c *Allocator) allocateFromRemoteCluster(gsa *allocationv1.GameServerAlloca
 		return nil
 	})
 
-	return converters.ConvertAllocationResponseToGSA(allocationResponse), err
+	return converters.ConvertAllocationResponseToGSA(allocationResponse, endpoint), err
 }
 
 // createRemoteClusterDialOption creates a grpc client dial option with proper certs to make a remote call.
@@ -451,7 +455,7 @@ func (c *Allocator) allocate(ctx context.Context, gsa *allocationv1.GameServerAl
 	case res := <-req.response: // wait for the batch to be completed
 		return res.gs, res.err
 	case <-ctx.Done():
-		return nil, errors.New("shutting down")
+		return nil, ErrTotalTimeoutExceeded
 	}
 }
 
@@ -494,20 +498,47 @@ func (c *Allocator) ListenAndAllocate(ctx context.Context, updateWorkerCount int
 	// continued.
 
 	var list []*agonesv1.GameServer
+	var sortKey uint64
 	requestCount := 0
 
 	for {
 		select {
 		case req := <-c.pendingRequests:
 			// refresh the list after every 100 allocations made in a single batch
-			requestCount++
 			if requestCount >= maxBatchBeforeRefresh {
 				list = nil
 				requestCount = 0
 			}
 
+			if runtime.FeatureEnabled(runtime.FeatureCountsAndLists) {
+				// SortKey returns the sorting values (list of Priorities) as a determinstic key.
+				// In case gsa.Spec.Priorities is nil this will still return a sortKey.
+				// In case of error this will return 0 for the sortKey.
+				newSortKey, err := req.gsa.SortKey()
+				if err != nil {
+					c.baseLogger.WithError(err).Warn("error getting sortKey for GameServerAllocationSpec", err)
+				}
+				// Set sortKey if this is the first request, or the previous request errored on creating a sortKey.
+				if sortKey == uint64(0) {
+					sortKey = newSortKey
+				}
+
+				if newSortKey != sortKey {
+					sortKey = newSortKey
+					list = nil
+					requestCount = 0
+				}
+			}
+
+			requestCount++
+
 			if list == nil {
-				list = c.allocationCache.ListSortedGameServers()
+				if !runtime.FeatureEnabled(runtime.FeatureCountsAndLists) || req.gsa.Spec.Scheduling == apis.Packed {
+					list = c.allocationCache.ListSortedGameServers(req.gsa)
+				} else {
+					// If FeatureCountsAndLists and Scheduling == Distributed, sort game servers by Priorities
+					list = c.allocationCache.ListSortedGameServersPriorities(req.gsa)
+				}
 			}
 
 			gs, index, err := findGameServerForAllocation(req.gsa, list)
@@ -550,7 +581,7 @@ func (c *Allocator) allocationUpdateWorkers(ctx context.Context, workerCount int
 			for {
 				select {
 				case res := <-updateQueue:
-					gs, err := c.applyAllocationToGameServer(ctx, res.request.gsa.Spec.MetaPatch, res.gs)
+					gs, err := c.applyAllocationToGameServer(ctx, res.request.gsa.Spec.MetaPatch, res.gs, res.request.gsa)
 					if err != nil {
 						if !k8serrors.IsConflict(errors.Cause(err)) {
 							// since we could not allocate, we should put it back
@@ -561,7 +592,6 @@ func (c *Allocator) allocationUpdateWorkers(ctx context.Context, workerCount int
 						res.err = errors.Wrap(err, "error updating allocated gameserver")
 					} else {
 						res.gs = gs
-						c.recorder.Event(res.gs, corev1.EventTypeNormal, string(res.gs.Status.State), "Allocated")
 					}
 
 					res.request.response <- res
@@ -577,7 +607,7 @@ func (c *Allocator) allocationUpdateWorkers(ctx context.Context, workerCount int
 
 // applyAllocationToGameServer patches the inputted GameServer with the allocation metadata changes, and updates it to the Allocated State.
 // Returns the updated GameServer.
-func (c *Allocator) applyAllocationToGameServer(ctx context.Context, mp allocationv1.MetaPatch, gs *agonesv1.GameServer) (*agonesv1.GameServer, error) {
+func (c *Allocator) applyAllocationToGameServer(ctx context.Context, mp allocationv1.MetaPatch, gs *agonesv1.GameServer, gsa *allocationv1.GameServerAllocation) (*agonesv1.GameServer, error) {
 	// patch ObjectMeta labels
 	if mp.Labels != nil {
 		if gs.ObjectMeta.Labels == nil {
@@ -604,7 +634,37 @@ func (c *Allocator) applyAllocationToGameServer(ctx context.Context, mp allocati
 	gs.ObjectMeta.Annotations[LastAllocatedAnnotationKey] = string(ts)
 	gs.Status.State = agonesv1.GameServerStateAllocated
 
-	return c.gameServerGetter.GameServers(gs.ObjectMeta.Namespace).Update(ctx, gs, metav1.UpdateOptions{})
+	// perfom any Counter or List actions
+	var counterErrors error
+	var listErrors error
+	if runtime.FeatureEnabled(runtime.FeatureCountsAndLists) {
+		if gsa.Spec.Counters != nil {
+			for counter, ca := range gsa.Spec.Counters {
+				counterErrors = goErrors.Join(counterErrors, ca.CounterActions(counter, gs))
+			}
+		}
+		if gsa.Spec.Lists != nil {
+			for list, la := range gsa.Spec.Lists {
+				listErrors = goErrors.Join(listErrors, la.ListActions(list, gs))
+			}
+		}
+	}
+
+	gsUpdate, updateErr := c.gameServerGetter.GameServers(gs.ObjectMeta.Namespace).Update(ctx, gs, metav1.UpdateOptions{})
+	if updateErr != nil {
+		return gsUpdate, updateErr
+	}
+
+	// If successful Update record any Counter or List action errors as a warning
+	if counterErrors != nil {
+		c.recorder.Event(gsUpdate, corev1.EventTypeWarning, "CounterActionError", counterErrors.Error())
+	}
+	if listErrors != nil {
+		c.recorder.Event(gsUpdate, corev1.EventTypeWarning, "ListActionError", listErrors.Error())
+	}
+	c.recorder.Event(gsUpdate, corev1.EventTypeNormal, string(gsUpdate.Status.State), "Allocated")
+
+	return gsUpdate, updateErr
 }
 
 // Retry retries fn based on backoff provided.
@@ -632,7 +692,7 @@ func Retry(backoff wait.Backoff, fn func() error) error {
 			return false, nil
 		}
 	})
-	if err == wait.ErrWaitTimeout {
+	if wait.Interrupted(err) {
 		err = lastConflictErr
 	}
 	return err

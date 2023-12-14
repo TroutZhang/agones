@@ -18,10 +18,12 @@ package runtime
 
 import (
 	"fmt"
+	"time"
 
-	joonix "github.com/joonix/log"
+	gwruntime "github.com/grpc-ecosystem/grpc-gateway/v2/runtime"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
+	"google.golang.org/protobuf/encoding/protojson"
 	"k8s.io/apimachinery/pkg/util/runtime"
 )
 
@@ -34,7 +36,14 @@ type stackTracer interface {
 
 // replace the standard glog error logger, with a logrus one
 func init() {
-	logrus.SetFormatter(&joonix.FluentdFormatter{})
+	logrus.SetFormatter(&logrus.JSONFormatter{
+		TimestampFormat: time.RFC3339Nano,
+		FieldMap: logrus.FieldMap{
+			logrus.FieldKeyTime:  "time",
+			logrus.FieldKeyLevel: "severity",
+			logrus.FieldKeyMsg:   "message",
+		},
+	})
 
 	runtime.ErrorHandlers[0] = func(err error) {
 		if stackTrace, ok := err.(stackTracer); ok {
@@ -80,4 +89,24 @@ func NewLoggerWithSource(source string) *logrus.Entry {
 // such as when you have a struct with methods
 func NewLoggerWithType(obj interface{}) *logrus.Entry {
 	return NewLoggerWithSource(fmt.Sprintf("%T", obj))
+}
+
+// NewServerMux returns a ServeMux which is a request multiplexer for grpc-gateway.
+// It matches http requests to pattern and invokes the corresponding handler.
+// ref: https://grpc-ecosystem.github.io/grpc-gateway/docs/development/grpc-gateway_v2_migration_guide/#we-now-emit-default-values-for-all-fields
+func NewServerMux() *gwruntime.ServeMux {
+	mux := gwruntime.NewServeMux(
+		gwruntime.WithMarshalerOption(gwruntime.MIMEWildcard, &gwruntime.HTTPBodyMarshaler{
+			Marshaler: &gwruntime.JSONPb{
+				MarshalOptions: protojson.MarshalOptions{
+					UseProtoNames:   true,
+					EmitUnpopulated: true,
+				},
+				UnmarshalOptions: protojson.UnmarshalOptions{
+					DiscardUnknown: true,
+				},
+			},
+		}),
+	)
+	return mux
 }

@@ -124,7 +124,7 @@ func TestMissingPodControllerSyncGameServer(t *testing.T) {
 				Spec: newSingleContainerSpec(), Status: agonesv1.GameServerStatus{}}
 			gs.ApplyDefaults()
 
-			pod, err := gs.Pod()
+			pod, err := gs.Pod(agtesting.FakeAPIHooks{})
 			assert.NoError(t, err)
 
 			gs, pod = v.setup(gs, pod)
@@ -184,7 +184,7 @@ func TestMissingPodControllerRun(t *testing.T) {
 	defer cancel()
 
 	go func() {
-		err := c.Run(ctx)
+		err := c.Run(ctx, 1)
 		assert.Nil(t, err, "Run should not error")
 	}()
 

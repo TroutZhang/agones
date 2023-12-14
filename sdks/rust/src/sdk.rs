@@ -20,7 +20,13 @@ mod api {
 }
 
 use api::sdk_client::SdkClient;
-pub use api::GameServer;
+pub use api::{
+    game_server::{
+        status::{PlayerStatus, Port},
+        ObjectMeta, Spec, Status,
+    },
+    GameServer,
+};
 
 pub type WatchStream = tonic::Streaming<GameServer>;
 
@@ -60,12 +66,41 @@ impl Sdk {
         )
         .parse()?;
 
+        Self::new_internal(addr, keep_alive).await
+    }
+
+    pub async fn new_with_host(
+        host: Option<String>,
+        port: Option<u16>,
+        keep_alive: Option<Duration>,
+    ) -> Result<Self> {
+        let addr: http::Uri = format!(
+            "{}:{}",
+            host.unwrap_or_else(|| {
+                env::var("AGONES_SDK_GRPC_HOST")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or("http://localhost".to_owned())
+            }),
+            port.unwrap_or_else(|| {
+                env::var("AGONES_SDK_GRPC_PORT")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(9357)
+            })
+        )
+        .parse()?;
+
+        Self::new_internal(addr, keep_alive).await
+    }
+
+    async fn new_internal(addr: http::Uri, keep_alive: Option<Duration>) -> Result<Self> {
         let builder = tonic::transport::channel::Channel::builder(addr)
             .connect_timeout(Duration::from_secs(30))
             .keep_alive_timeout(keep_alive.unwrap_or_else(|| Duration::from_secs(30)));
 
         // will only attempt to connect on first invocation, so won't exit straight away.
-        let channel = builder.connect_lazy()?;
+        let channel = builder.connect_lazy();
         let mut client = SdkClient::new(channel.clone());
         let alpha = Alpha::new(channel);
 

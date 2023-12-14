@@ -21,6 +21,7 @@ import (
 	"agones.dev/agones/pkg/sdk"
 	"agones.dev/agones/pkg/util/runtime"
 	"github.com/stretchr/testify/assert"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -48,9 +49,10 @@ func TestConvert(t *testing.T) {
 			},
 		},
 		Status: agonesv1.GameServerStatus{
-			NodeName: "george",
-			Address:  "127.0.0.1",
-			State:    "Ready",
+			NodeName:  "george",
+			Address:   "127.0.0.1",
+			Addresses: []corev1.NodeAddress{{Type: "SomeAddressType", Address: "127.0.0.1"}},
+			State:     "Ready",
 			Ports: []agonesv1.GameServerStatusPort{
 				{Name: "default", Port: 12345},
 				{Name: "beacon", Port: 123123},
@@ -70,6 +72,7 @@ func TestConvert(t *testing.T) {
 		assert.Equal(t, fixture.Spec.Health.FailureThreshold, sdkGs.Spec.Health.FailureThreshold)
 		assert.Equal(t, fixture.Spec.Health.PeriodSeconds, sdkGs.Spec.Health.PeriodSeconds)
 		assert.Equal(t, fixture.Status.Address, sdkGs.Status.Address)
+		assert.Equal(t, []*sdk.GameServer_Status_Address{{Type: "SomeAddressType", Address: "127.0.0.1"}}, sdkGs.Status.Addresses)
 		assert.Equal(t, string(fixture.Status.State), sdkGs.Status.State)
 		assert.Len(t, sdkGs.Status.Ports, len(fixture.Status.Ports))
 		for i, fp := range fixture.Status.Ports {
@@ -102,6 +105,45 @@ func TestConvert(t *testing.T) {
 		assert.Equal(t, gs.Status.Players.Capacity, sdkGs.Status.Players.Capacity)
 		assert.Equal(t, gs.Status.Players.Count, sdkGs.Status.Players.Count)
 		assert.Equal(t, gs.Status.Players.IDs, sdkGs.Status.Players.Ids)
+	})
+
+	t.Run(string(runtime.FeatureCountsAndLists)+" disabled", func(t *testing.T) {
+		assert.NoError(t, runtime.ParseFeatures(""))
+
+		gs := fixture.DeepCopy()
+
+		sdkGs := convert(gs)
+		eq(t, fixture, sdkGs)
+		assert.Zero(t, sdkGs.ObjectMeta.DeletionTimestamp)
+		assert.Nil(t, sdkGs.Status.Counters)
+		assert.Nil(t, sdkGs.Status.Lists)
+	})
+
+	t.Run(string(runtime.FeatureCountsAndLists)+" enabled", func(t *testing.T) {
+		assert.NoError(t, runtime.ParseFeatures(string(runtime.FeatureCountsAndLists)+"=true"))
+
+		gs := fixture.DeepCopy()
+		gs.Status.Counters = map[string]agonesv1.CounterStatus{
+			"Games": {
+				Count:    1,
+				Capacity: 999,
+			},
+		}
+		gs.Status.Lists = map[string]agonesv1.ListStatus{
+			"Lobbies": {
+				Capacity: 100,
+				Values:   []string{"Lobby1", "Lobby2", "Lobby0"},
+			},
+		}
+
+		sdkGs := convert(gs)
+		eq(t, fixture, sdkGs)
+		assert.Zero(t, sdkGs.ObjectMeta.DeletionTimestamp)
+		assert.Equal(t, gs.Status.Counters["Games"].Count, sdkGs.Status.Counters["Games"].Count)
+		assert.Equal(t, gs.Status.Counters["Games"].Capacity, sdkGs.Status.Counters["Games"].Capacity)
+		// Using assert.Equal for List Values here to check for items and item order equal in the List.
+		assert.Equal(t, gs.Status.Lists["Lobbies"].Values, sdkGs.Status.Lists["Lobbies"].Values)
+		assert.Equal(t, gs.Status.Lists["Lobbies"].Capacity, sdkGs.Status.Lists["Lobbies"].Capacity)
 	})
 
 	t.Run("DeletionTimestamp", func(t *testing.T) {

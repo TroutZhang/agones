@@ -15,14 +15,22 @@
 package e2e
 
 import (
+	"bytes"
 	"context"
+	cryptorand "crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
 	"fmt"
+	"math/big"
 	"math/rand"
 	"strings"
 	"testing"
 	"time"
 
 	agonesv1 "agones.dev/agones/pkg/apis/agones/v1"
+	allocationv1 "agones.dev/agones/pkg/apis/allocation/v1"
 	autoscalingv1 "agones.dev/agones/pkg/apis/autoscaling/v1"
 	"agones.dev/agones/pkg/util/runtime"
 	e2e "agones.dev/agones/test/e2e/framework"
@@ -66,11 +74,6 @@ func TestAutoscalerBasicFunctions(t *testing.T) {
 	fas, err := fleetautoscalers.Create(ctx, defaultFas, metav1.CreateOptions{})
 	require.NoError(t, err)
 	defer fleetautoscalers.Delete(ctx, fas.ObjectMeta.Name, metav1.DeleteOptions{}) // nolint:errcheck
-
-	// If the CustomFasSyncInterval feature flag is enabled, the value of fas.spec.sync are equal
-	if runtime.FeatureEnabled(runtime.FeatureCustomFasSyncInterval) {
-		require.Equal(t, defaultFas.Spec.Sync.FixedInterval.Seconds, fas.Spec.Sync.FixedInterval.Seconds)
-	}
 
 	// the fleet autoscaler should scale the fleet up now up to BufferSize
 	bufferSize := int32(fas.Spec.Policy.Buffer.BufferSize.IntValue())
@@ -175,12 +178,9 @@ func TestFleetAutoscalerDefaultSyncInterval(t *testing.T) {
 		return
 	}
 
-	// If the CustomFasSyncInterval feature flag is enabled, fas.spec.sync should be set to its default value
-	if runtime.FeatureEnabled(runtime.FeatureCustomFasSyncInterval) {
-		defaultSyncIntervalFas := &autoscalingv1.FleetAutoscaler{}
-		defaultSyncIntervalFas.ApplyDefaults()
-		assert.Equal(t, defaultSyncIntervalFas.Spec.Sync.FixedInterval.Seconds, fas.Spec.Sync.FixedInterval.Seconds)
-	}
+	defaultSyncIntervalFas := &autoscalingv1.FleetAutoscaler{}
+	defaultSyncIntervalFas.ApplyDefaults()
+	assert.Equal(t, defaultSyncIntervalFas.Spec.Sync.FixedInterval.Seconds, fas.Spec.Sync.FixedInterval.Seconds)
 }
 
 // TestFleetAutoScalerRollingUpdate - test fleet with RollingUpdate strategy work with
@@ -254,7 +254,7 @@ func TestFleetAutoScalerRollingUpdate(t *testing.T) {
 
 	selector := labels.SelectorFromSet(labels.Set{agonesv1.FleetNameLabel: flt.ObjectMeta.Name})
 	// Wait till new GSS is created
-	err = wait.PollImmediate(1*time.Second, 30*time.Second, func() (bool, error) {
+	err = wait.PollUntilContextTimeout(context.Background(), 1*time.Second, 30*time.Second, true, func(ctx context.Context) (bool, error) {
 		gssList, err := framework.AgonesClient.AgonesV1().GameServerSets(framework.Namespace).List(ctx,
 			metav1.ListOptions{LabelSelector: selector.String()})
 		if err != nil {
@@ -267,7 +267,7 @@ func TestFleetAutoScalerRollingUpdate(t *testing.T) {
 	// Check that total number of gameservers in the system does not goes lower than RollingUpdate
 	// parameters (deleting no more than maxUnavailable servers at a time)
 	// Wait for old GSSet to be deleted
-	err = wait.PollImmediate(1*time.Second, 5*time.Minute, func() (bool, error) {
+	err = wait.PollUntilContextTimeout(context.Background(), 1*time.Second, 5*time.Minute, true, func(ctx context.Context) (bool, error) {
 		list, err := framework.AgonesClient.AgonesV1().GameServers(framework.Namespace).List(ctx,
 			metav1.ListOptions{LabelSelector: selector.String()})
 		if err != nil {
@@ -474,7 +474,7 @@ func TestAutoscalerWebhook(t *testing.T) {
 
 	// Cause an error in Webhook config
 	// Use wrong service Path
-	err = wait.PollImmediate(time.Second, time.Minute, func() (bool, error) {
+	err = wait.PollUntilContextTimeout(context.Background(), time.Second, time.Minute, true, func(ctx context.Context) (bool, error) {
 		fas, err = fleetautoscalers.Get(ctx, fas.ObjectMeta.Name, metav1.GetOptions{})
 		if err != nil {
 			return true, err
@@ -499,7 +499,7 @@ func TestAutoscalerWebhook(t *testing.T) {
 
 	// Error - net/http: request canceled while waiting for connection (Client.Timeout exceeded
 	// while awaiting headers)
-	err = wait.PollImmediate(time.Second, time.Minute, func() (bool, error) {
+	err = wait.PollUntilContextTimeout(context.Background(), time.Second, time.Minute, true, func(ctx context.Context) (bool, error) {
 		events := framework.KubeClient.CoreV1().Events(framework.Namespace)
 		l, err = events.List(ctx, metav1.ListOptions{FieldSelector: fields.AndSelectors(fields.OneTermEqualSelector("involvedObject.name", fas.ObjectMeta.Name), fields.OneTermEqualSelector("type", "Warning")).String()})
 		if err != nil {
@@ -516,90 +516,17 @@ func TestAutoscalerWebhook(t *testing.T) {
 	assert.True(t, found, "Expected error was not received")
 }
 
-// Instructions: https://agones.dev/site/docs/getting-started/create-webhook-fleetautoscaler/#chapter-2-configuring-https-fleetautoscaler-webhook-with-ca-bundle
-// Validity
-// 	Not Before: Apr 12 01:37:57 2022 GMT
-//	Not After : Aug 25 01:37:57 2023 GMT
-
-var webhookKey = `
------BEGIN RSA PRIVATE KEY-----
-MIIEpgIBAAKCAQEAwMPoSpFJan9iW/W+hbdh8BmMrCmJLGBVFx/4T2l63b5Iz/pb
-dg6+++mByDNa1SxzM9JfKkK9Sc+xwYwF3u88NniWlx69NfBpQpnHApgTTMsysQFK
-RrvtOmvfon9FXL8B1i1u0e9/sOXobQn2yZfxrQIADl5VDYTIoARPwkf/V71TlEsX
-Z8Q9K4zrWU+KiIluf/krGqLObhg9nnkNvOB7eHYHtdJPfUJfduegQoJ6ZCPD/6eP
-368Wr6Vp3qLuW9hQFWJOb+8WShMpNBD7V5BQULYYxm/v65wpz/YRx2SXGD+Im00V
-FpZt5+SZzQm9d3dfb8Glzt1KaXqWlO0OlkuKqwIDAQABAoIBAQCPSI+/7aKOoMUx
-6caGijsoRzWDOxSVgb1+BOuDy7niXXCt90BIzskzYuxvLY0U64duO681MIqW9OUC
-ItyyS02Mh7IX/mdSUrNLKBb/XJ7r9BZn77eQQFwjks+Wb9fVCr2IwBihv85AZYSQ
-mFlym5iuqs/z3jaGZ+7g0pOeq/mm8u5e1W8r3Ncizqwe9g4yz3+4WXH7TGzXJIb5
-BjGbJ7IJJLZBSOpjxnbej5n/lezxwZ/WSqfy7q37g9eleWgtY9qnCXJ4v+x8xVHa
-Y9P06MliPiXCwUCuYf4AOb7zBIjY9hvAct7KCY5Vqn2vefeXesRpZruXX0uHvNxE
-s8CdVl5RAoGBAPHX9+PvTMz/kQVmItkFjtj8iaDTF8qxSBz5WcDcGpe9bZ0Sjb3N
-m+BJnnuRvGL+7DXNmua+nr3O+WcPEINZkaTzDo0IlY7zta9J+cLQCGWjcH6bDFu1
-0ZJglJ82reyCPsgfcYFi2LZgsFiFc5u3WkGdqI9dyBnmusMTknWGy48XAoGBAMwM
-f7D1ANr9d15hDyHcyoneaC5iP2RfK1iVVGJ4Ov/3qbtw8DGjn0B01mjgEha5cZsq
-apcVyHD0rIp4n//J83fxsgPBHcgOaZdjC5LUi/N9VjVhmI3PrhXk6I/lRZYisGrv
-9kb2IgvovFCHwPoQ/SJW2RBl0lFsdHIz91zs3P2NAoGBAK7Ox5yXHTFUTXPUlr29
-mbpYF/cKfjkBmblvtyODNSmXP8L4ZUHbe59MN2TkO4Jm90AQpLXC9SUHlRicN/hp
-ZrAPC+Z/XPNeT2Yrl3/sNRWaZLbuxakIrDoc23CV6nN41X570+SNGU4CZ5UkqSLW
-DkQ9fFhclkW6lCZrYELZMwvzAoGBALMNwLtis0Z3p1jdaO75FY4X6WnScvg7/whz
-uaHTCUr2ZC4Ec/HLOALSxBcxkQ352vQjK3e6+LIOMp4sLZLC/2/gWqqqutyDsSrU
-EiLdepXHBXBAXSML/CJgRaeHtCGD/TVJrt4kPEohB6bPCYsmf0qz1TRrdTxYJHLW
-oRkdDOs9AoGBAOm+mMrA+twhaS+ggU37UHvUQGVTra33sQVd008dnzaK5wRuIxSu
-J3MH0y8KjS+UKBn8PjsEXMQO/t9LIBqo8A4HuZIZqowoGR6GzrOfnE7lnwf3BKvY
-kgmVel9Ssrf7VeJPsb/w2TgL3IIZDR+VXtC1czlwNaQLPxBfmOQa4VyP
------END RSA PRIVATE KEY-----`
-
-var caPem = `
------BEGIN CERTIFICATE-----
-MIIDRzCCAi+gAwIBAgIUY3Cpf8jTCBaoNZ++5gyZiRq27hMwDQYJKoZIhvcNAQEL
-BQAwMzELMAkGA1UEBhMCQVUxEzARBgNVBAgMClNvbWUtU3RhdGUxDzANBgNVBAoM
-BkFnb25lczAeFw0yMjA0MTIwMTM1NTNaFw0yNTAxMzAwMTM1NTNaMDMxCzAJBgNV
-BAYTAkFVMRMwEQYDVQQIDApTb21lLVN0YXRlMQ8wDQYDVQQKDAZBZ29uZXMwggEi
-MA0GCSqGSIb3DQEBAQUAA4IBDwAwggEKAoIBAQCq1uP65QAXdFCYUC+JiH71pxFy
-8AA7KwzkFGEIqObE5JpJwnuahkWy29QZzKJ1RKneN34+WtrHVoRhjUiFXYtBOzTb
-twd//EJkvYe/5uhV4K4FxMI5+VE81W/66FDc4q0YD6whyT5qyjrLyu8tb2jqbXgY
-UaPiiGsbhCwDpq/FdOT71N2V5kBKu+z8PhqDrMUiDsAnKgwIuk6s8D947jv44Q7e
-bxandSXnYqAUwqAFhT2YyZnfsqQGuOdD83A62Day1eUQnsv3dKL6H7F25jN5/G42
-7GT34Wex/JC7VqfC5RfcrUsr4UOSn4ZyzlCLN8mIM1kU5nMtrYBHZZWxH8ghAgMB
-AAGjUzBRMB0GA1UdDgQWBBRWt1C5GFuIdXqmQA8uhqqwUPmjtDAfBgNVHSMEGDAW
-gBRWt1C5GFuIdXqmQA8uhqqwUPmjtDAPBgNVHRMBAf8EBTADAQH/MA0GCSqGSIb3
-DQEBCwUAA4IBAQApFN9bzBYBWZp4sTyglIjQZzeRdZ/S8WyjhbFeHoqA42izAGGB
-rLiKHKym43U/qDxp93Y0Si0K2dv4fyJWqlRZ+gtmVPLwjqkFCQEs/K3+BUHTWE5+
-Tx4EStkIJs8M2PipnUMCAICEO9JCp5bw5lloTI4fpIvxOXHiCC6pRmDW9GyyUywT
-MoWF7VO43V+aKjMdYxqSK1928Foql4QltnOtPtwySAQujr4kTAdhPuOdnMOdXIS5
-6r3Qftfyui85HzhimrAaQ3ZulbNvw7lCWl1BIiidn6VgpXZM4GNFxL5RWIixAyWK
-V3FOACAGS/XJ2IirQ0+Ed5B7GCGXx58CqBN5
------END CERTIFICATE-----`
-
-var webhookCrt = `
------BEGIN CERTIFICATE-----
-MIIDQTCCAimgAwIBAgIUA9ADz3wPH/XvuIei9mWSLOvnzXswDQYJKoZIhvcNAQEL
-BQAwMzELMAkGA1UEBhMCQVUxEzARBgNVBAgMClNvbWUtU3RhdGUxDzANBgNVBAoM
-BkFnb25lczAeFw0yMjA0MTIwMTM3NTdaFw0yMzA4MjUwMTM3NTdaMC0xKzApBgNV
-BAMMImF1dG9zY2FsZXItdGxzLXNlcnZpY2UuZGVmYXVsdC5zdmMwggEiMA0GCSqG
-SIb3DQEBAQUAA4IBDwAwggEKAoIBAQDAw+hKkUlqf2Jb9b6Ft2HwGYysKYksYFUX
-H/hPaXrdvkjP+lt2Dr776YHIM1rVLHMz0l8qQr1Jz7HBjAXe7zw2eJaXHr018GlC
-mccCmBNMyzKxAUpGu+06a9+if0VcvwHWLW7R73+w5ehtCfbJl/GtAgAOXlUNhMig
-BE/CR/9XvVOUSxdnxD0rjOtZT4qIiW5/+Ssaos5uGD2eeQ284Ht4dge10k99Ql92
-56BCgnpkI8P/p4/frxavpWneou5b2FAVYk5v7xZKEyk0EPtXkFBQthjGb+/rnCnP
-9hHHZJcYP4ibTRUWlm3n5JnNCb13d19vwaXO3UppepaU7Q6WS4qrAgMBAAGjUzBR
-MAsGA1UdDwQEAwIHgDATBgNVHSUEDDAKBggrBgEFBQcDATAtBgNVHREEJjAkgiJh
-dXRvc2NhbGVyLXRscy1zZXJ2aWNlLmRlZmF1bHQuc3ZjMA0GCSqGSIb3DQEBCwUA
-A4IBAQBO8MVRJVeaCg80XxnIgcYFXqwgPVqmugYure8cPwsD/tMaISeSavYT/X7L
-YIRUnvOgZtjXpX2+43PZjmoxCtKJUa9Q8qWO4MU/6aD1j6wSasjygaOiW5UEKV4j
-AWt5U8Jbzf5NZLV0udYErSNE1PqbI8zkELxZ5Usf11C2Nu892lrpJrg6CZjiG82w
-PZEUAxKzv6X3w9nF+3fqHkBgRzSwZF9jEAZUkqgqVGAeh2Pzp5O7ciFCL4jAwX9y
-DjTCc3SwhWOqeVVnwjmrpPb14t74boH4TijTuK+umGI6U9g0WVmZA8heYil0x7iP
-xgD9ZcK4JyVWRkFtu1UFbMuR/M1P
------END CERTIFICATE-----`
-
 func TestFleetAutoscalerTLSWebhook(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-
 	// we hardcode 'default' namespace here because certificates above are generated to use this one
 	defaultNS := "default"
+
+	// certs
+	caPem, _, caCert, caPrivKey, err := generateRootCA()
+	require.NoError(t, err)
+	clientCertPEM, clientCertPrivKeyPEM, err := generateLocalCert(caCert, caPrivKey)
+	require.NoError(t, err)
 
 	secr := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
@@ -609,11 +536,11 @@ func TestFleetAutoscalerTLSWebhook(t *testing.T) {
 		Data: make(map[string][]byte),
 	}
 
-	secr.Data[corev1.TLSCertKey] = []byte(webhookCrt)
-	secr.Data[corev1.TLSPrivateKeyKey] = []byte(webhookKey)
+	secr.Data[corev1.TLSCertKey] = clientCertPEM
+	secr.Data[corev1.TLSPrivateKeyKey] = clientCertPrivKeyPEM
 
 	secrets := framework.KubeClient.CoreV1().Secrets(defaultNS)
-	secr, err := secrets.Create(ctx, secr.DeepCopy(), metav1.CreateOptions{})
+	secr, err = secrets.Create(ctx, secr.DeepCopy(), metav1.CreateOptions{})
 	if assert.Nil(t, err) {
 		defer secrets.Delete(ctx, secr.ObjectMeta.Name, metav1.DeleteOptions{}) // nolint:errcheck
 	}
@@ -647,7 +574,7 @@ func TestFleetAutoscalerTLSWebhook(t *testing.T) {
 	}
 
 	// making sure the service is really gone.
-	err = wait.PollImmediate(2*time.Second, time.Minute, func() (bool, error) {
+	err = wait.PollUntilContextTimeout(context.Background(), 2*time.Second, time.Minute, true, func(ctx context.Context) (bool, error) {
 		_, err := framework.KubeClient.CoreV1().Services(defaultNS).Get(ctx, svc.ObjectMeta.Name, metav1.GetOptions{})
 		return k8serrors.IsNotFound(err), nil
 	})
@@ -685,7 +612,7 @@ func TestFleetAutoscalerTLSWebhook(t *testing.T) {
 			Namespace: defaultNS,
 			Path:      &path,
 		},
-		CABundle: []byte(caPem),
+		CABundle: caPem,
 	}
 	fas, err = fleetautoscalers.Create(ctx, fas.DeepCopy(), metav1.CreateOptions{})
 	if assert.Nil(t, err) {
@@ -717,7 +644,7 @@ func defaultAutoscalerWebhook(namespace string) (*corev1.Pod, *corev1.Service) {
 		},
 		Spec: corev1.PodSpec{
 			Containers: []corev1.Container{{Name: "webhook",
-				Image:           "gcr.io/agones-images/autoscaler-webhook:0.5",
+				Image:           "us-docker.pkg.dev/agones-images/examples/autoscaler-webhook:0.9",
 				ImagePullPolicy: corev1.PullAlways,
 				Ports: []corev1.ContainerPort{{
 					ContainerPort: 8000,
@@ -744,4 +671,775 @@ func defaultAutoscalerWebhook(namespace string) (*corev1.Pod, *corev1.Service) {
 	}
 
 	return pod, service
+}
+
+// Instructions: https://agones.dev/site/docs/getting-started/create-webhook-fleetautoscaler/#chapter-2-configuring-https-fleetautoscaler-webhook-with-ca-bundle
+// but also, credits/inspiration to https://github.com/kubernetes/autoscaler/blob/master/cluster-autoscaler/cloudprovider/aws/aws-sdk-go/awstesting/certificate_utils.go
+
+func generateRootCA() (
+	caPEM, caPrivKeyPEM []byte, caCert *x509.Certificate, caPrivKey *rsa.PrivateKey, err error,
+) {
+	caCert = &x509.Certificate{
+		SerialNumber: big.NewInt(42),
+		Subject: pkix.Name{
+			Country:      []string{"US"},
+			Organization: []string{"Agones"},
+			CommonName:   "Test Root CA",
+		},
+		NotBefore: time.Now().Add(-time.Minute),
+		NotAfter:  time.Now().AddDate(1, 0, 0),
+		KeyUsage:  x509.KeyUsageCertSign | x509.KeyUsageCRLSign | x509.KeyUsageDigitalSignature,
+		ExtKeyUsage: []x509.ExtKeyUsage{
+			x509.ExtKeyUsageClientAuth,
+			x509.ExtKeyUsageServerAuth,
+		},
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+	}
+
+	// Create CA private and public key
+	caPrivKey, err = rsa.GenerateKey(cryptorand.Reader, 4096)
+	if err != nil {
+		return nil, nil, nil, nil, fmt.Errorf("failed generate CA RSA key, %w", err)
+	}
+
+	// Create CA certificate
+	caBytes, err := x509.CreateCertificate(cryptorand.Reader, caCert, caCert, &caPrivKey.PublicKey, caPrivKey)
+	if err != nil {
+		return nil, nil, nil, nil, fmt.Errorf("failed generate CA certificate, %w", err)
+	}
+
+	// PEM encode CA certificate and private key
+	var caPEMBuf bytes.Buffer
+	err = pem.Encode(&caPEMBuf, &pem.Block{
+		Type:  "CERTIFICATE",
+		Bytes: caBytes,
+	})
+	if err != nil {
+		return nil, nil, nil, nil, fmt.Errorf("failed to endcode root PEM, %w", err)
+	}
+
+	var caPrivKeyPEMBuf bytes.Buffer
+	err = pem.Encode(&caPrivKeyPEMBuf, &pem.Block{
+		Type:  "RSA PRIVATE KEY",
+		Bytes: x509.MarshalPKCS1PrivateKey(caPrivKey),
+	})
+	if err != nil {
+		return nil, nil, nil, nil, fmt.Errorf("failed to endcode private root PEM, %w", err)
+	}
+
+	return caPEMBuf.Bytes(), caPrivKeyPEMBuf.Bytes(), caCert, caPrivKey, nil
+}
+
+func generateLocalCert(parentCert *x509.Certificate, parentPrivKey *rsa.PrivateKey) (
+	certPEM, certPrivKeyPEM []byte, err error,
+) {
+	cert := &x509.Certificate{
+		SerialNumber: big.NewInt(42),
+		Subject: pkix.Name{
+			Country:      []string{"US"},
+			Organization: []string{"Agones"},
+			CommonName:   "autoscaler-tls-service.default.svc",
+		},
+		NotBefore: time.Now().Add(-time.Minute),
+		NotAfter:  time.Now().AddDate(1, 0, 0),
+		ExtKeyUsage: []x509.ExtKeyUsage{
+			x509.ExtKeyUsageClientAuth,
+			x509.ExtKeyUsageServerAuth,
+		},
+		KeyUsage: x509.KeyUsageDigitalSignature,
+		DNSNames: []string{"autoscaler-tls-service.default.svc"},
+	}
+
+	// Create server private and public key
+	certPrivKey, err := rsa.GenerateKey(cryptorand.Reader, 4096)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to generate server RSA private key, %w", err)
+	}
+
+	// Create server certificate
+	certBytes, err := x509.CreateCertificate(cryptorand.Reader, cert, parentCert, &certPrivKey.PublicKey, parentPrivKey)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to generate server certificate, %w", err)
+	}
+
+	// PEM encode certificate and private key
+	var certPEMBuf bytes.Buffer
+	err = pem.Encode(&certPEMBuf, &pem.Block{
+		Type:  "CERTIFICATE",
+		Bytes: certBytes,
+	})
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to endcode certificate pem, %w", err)
+	}
+
+	var certPrivKeyPEMBuf bytes.Buffer
+	err = pem.Encode(&certPrivKeyPEMBuf, &pem.Block{
+		Type:  "RSA PRIVATE KEY",
+		Bytes: x509.MarshalPKCS1PrivateKey(certPrivKey),
+	})
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to endcode private pem, %w", err)
+	}
+
+	return certPEMBuf.Bytes(), certPrivKeyPEMBuf.Bytes(), nil
+}
+
+func TestCounterAutoscaler(t *testing.T) {
+	if !runtime.FeatureEnabled(runtime.FeatureCountsAndLists) {
+		t.SkipNow()
+	}
+	t.Parallel()
+
+	ctx := context.Background()
+	client := framework.AgonesClient.AgonesV1()
+	log := e2e.TestLogger(t)
+
+	flt := defaultFleet(framework.Namespace)
+	flt.Spec.Template.Spec.Counters = map[string]agonesv1.CounterStatus{
+		"players": {
+			Count:    7,  // AggregateCount 21
+			Capacity: 10, // AggregateCapacity 30
+		},
+		"sessions": {
+			Count:    0, // AggregateCount 0
+			Capacity: 5, // AggregateCapacity 15
+		},
+	}
+
+	flt, err := client.Fleets(framework.Namespace).Create(ctx, flt.DeepCopy(), metav1.CreateOptions{})
+	require.NoError(t, err)
+	defer client.Fleets(framework.Namespace).Delete(ctx, flt.ObjectMeta.Name, metav1.DeleteOptions{}) // nolint:errcheck
+	framework.AssertFleetCondition(t, flt, e2e.FleetReadyCount(flt.Spec.Replicas))
+
+	fleetautoscalers := framework.AgonesClient.AutoscalingV1().FleetAutoscalers(framework.Namespace)
+
+	counterFas := func(f func(fap *autoscalingv1.FleetAutoscalerPolicy)) *autoscalingv1.FleetAutoscaler {
+		fas := autoscalingv1.FleetAutoscaler{
+			ObjectMeta: metav1.ObjectMeta{Name: flt.ObjectMeta.Name + "-counter-autoscaler", Namespace: framework.Namespace},
+			Spec: autoscalingv1.FleetAutoscalerSpec{
+				FleetName: flt.ObjectMeta.Name,
+				Policy: autoscalingv1.FleetAutoscalerPolicy{
+					Type: autoscalingv1.CounterPolicyType,
+				},
+				Sync: &autoscalingv1.FleetAutoscalerSync{
+					Type: autoscalingv1.FixedIntervalSyncType,
+					FixedInterval: autoscalingv1.FixedIntervalSync{
+						Seconds: 1,
+					},
+				},
+			},
+		}
+		f(&fas.Spec.Policy)
+		return &fas
+	}
+
+	testCases := map[string]struct {
+		fas          *autoscalingv1.FleetAutoscaler
+		wantFasErr   bool
+		wantReplicas int32
+	}{
+		"Scale Down Buffer Int": {
+			fas: counterFas(func(fap *autoscalingv1.FleetAutoscalerPolicy) {
+				fap.Counter = &autoscalingv1.CounterPolicy{
+					Key:         "players",
+					BufferSize:  intstr.FromInt(5), // Buffer refers to the available capacity (AggregateCapacity - AggregateCount)
+					MinCapacity: 10,                // Min and MaxCapacity refer to the total capacity aggregated across the fleet, NOT the available capacity
+					MaxCapacity: 100,
+				}
+			}),
+			wantFasErr:   false,
+			wantReplicas: 2,
+		},
+		"Scale Up Buffer Int": {
+			fas: counterFas(func(fap *autoscalingv1.FleetAutoscalerPolicy) {
+				fap.Counter = &autoscalingv1.CounterPolicy{
+					Key:         "players",
+					BufferSize:  intstr.FromInt(25),
+					MinCapacity: 25,
+					MaxCapacity: 100,
+				}
+			}),
+			wantFasErr:   false,
+			wantReplicas: 9,
+		},
+		"Scale Down to MaxCapacity": {
+			fas: counterFas(func(fap *autoscalingv1.FleetAutoscalerPolicy) {
+				fap.Counter = &autoscalingv1.CounterPolicy{
+					Key:         "sessions",
+					BufferSize:  intstr.FromInt(5),
+					MinCapacity: 0,
+					MaxCapacity: 5,
+				}
+			}),
+			wantFasErr:   false,
+			wantReplicas: 1,
+		},
+		"Scale Up to MinCapacity": {
+			fas: counterFas(func(fap *autoscalingv1.FleetAutoscalerPolicy) {
+				fap.Counter = &autoscalingv1.CounterPolicy{
+					Key:         "sessions",
+					BufferSize:  intstr.FromInt(1),
+					MinCapacity: 30,
+					MaxCapacity: 100,
+				}
+			}),
+			wantFasErr:   false,
+			wantReplicas: 6,
+		},
+		"Cannot scale up (MaxCapacity)": {
+			fas: counterFas(func(fap *autoscalingv1.FleetAutoscalerPolicy) {
+				fap.Counter = &autoscalingv1.CounterPolicy{
+					Key:         "players",
+					BufferSize:  intstr.FromInt(10),
+					MinCapacity: 10,
+					MaxCapacity: 30,
+				}
+			}),
+			wantFasErr:   false,
+			wantReplicas: 3,
+		},
+		"Cannot scale down (MinCapacity)": {
+			fas: counterFas(func(fap *autoscalingv1.FleetAutoscalerPolicy) {
+				fap.Counter = &autoscalingv1.CounterPolicy{
+					Key:         "sessions",
+					BufferSize:  intstr.FromInt(5),
+					MinCapacity: 15,
+					MaxCapacity: 100,
+				}
+			}),
+			wantFasErr:   false,
+			wantReplicas: 3,
+		},
+		"Buffer Greater than MinCapacity invalid FAS": {
+			fas: counterFas(func(fap *autoscalingv1.FleetAutoscalerPolicy) {
+				fap.Counter = &autoscalingv1.CounterPolicy{
+					Key:         "players",
+					BufferSize:  intstr.FromInt(25),
+					MinCapacity: 10,
+					MaxCapacity: 100,
+				}
+			}),
+			wantFasErr: true,
+		},
+	}
+	for name, testCase := range testCases {
+		t.Run(name, func(t *testing.T) {
+
+			fas, err := fleetautoscalers.Create(ctx, testCase.fas, metav1.CreateOptions{})
+			if testCase.wantFasErr {
+				assert.Error(t, err)
+				return
+			}
+			assert.NoError(t, err)
+
+			framework.AssertFleetCondition(t, flt, e2e.FleetReadyCount(testCase.wantReplicas))
+			fleetautoscalers.Delete(ctx, fas.ObjectMeta.Name, metav1.DeleteOptions{}) // nolint:errcheck
+
+			// Return to starting 3 replicas
+			framework.ScaleFleet(t, log, flt, 3)
+			framework.AssertFleetCondition(t, flt, e2e.FleetReadyCount(3))
+		})
+	}
+}
+
+func TestCounterAutoscalerAllocated(t *testing.T) {
+	if !runtime.FeatureEnabled(runtime.FeatureCountsAndLists) {
+		t.SkipNow()
+	}
+	t.Parallel()
+
+	ctx := context.Background()
+	client := framework.AgonesClient.AgonesV1()
+	log := e2e.TestLogger(t)
+
+	defaultFlt := defaultFleet(framework.Namespace)
+	defaultFlt.Spec.Template.Spec.Counters = map[string]agonesv1.CounterStatus{
+		"players": {
+			Count:    7,  // AggregateCount 21
+			Capacity: 10, // AggregateCapacity 30
+		},
+	}
+
+	fleetautoscalers := framework.AgonesClient.AutoscalingV1().FleetAutoscalers(framework.Namespace)
+
+	testCases := map[string]struct {
+		fas             autoscalingv1.CounterPolicy
+		wantAllocatedGs int32 // Must be >= 0 && <= 3
+		wantReadyGs     int32
+	}{
+		"Scale Down Buffer Percent": {
+			fas: autoscalingv1.CounterPolicy{
+				Key:         "players",
+				BufferSize:  intstr.FromString("5%"),
+				MinCapacity: 10,
+				MaxCapacity: 100,
+			},
+			wantAllocatedGs: 0,
+			wantReadyGs:     1,
+		},
+		"Scale Up Buffer Percent": {
+			fas: autoscalingv1.CounterPolicy{
+				Key:         "players",
+				BufferSize:  intstr.FromString("40%"),
+				MinCapacity: 10,
+				MaxCapacity: 100,
+			},
+			wantAllocatedGs: 3,
+			wantReadyGs:     2,
+		},
+	}
+	// nolint:dupl  // Linter errors on lines are duplicate of TestListAutoscalerAllocated
+	for name, testCase := range testCases {
+		t.Run(name, func(t *testing.T) {
+			flt, err := client.Fleets(framework.Namespace).Create(ctx, defaultFlt.DeepCopy(), metav1.CreateOptions{})
+			require.NoError(t, err)
+			defer client.Fleets(framework.Namespace).Delete(ctx, flt.ObjectMeta.Name, metav1.DeleteOptions{}) // nolint:errcheck
+			framework.AssertFleetCondition(t, flt, e2e.FleetReadyCount(flt.Spec.Replicas))
+
+			gsa := allocationv1.GameServerAllocation{
+				Spec: allocationv1.GameServerAllocationSpec{
+					Selectors: []allocationv1.GameServerSelector{
+						{LabelSelector: metav1.LabelSelector{
+							MatchLabels: map[string]string{agonesv1.FleetNameLabel: flt.ObjectMeta.Name}}},
+					}}}
+
+			// Allocate game servers, as Buffer Percent scales up (or down) based on allocated aggregate capacity
+			for i := int32(0); i < testCase.wantAllocatedGs; i++ {
+				_, err := framework.AgonesClient.AllocationV1().GameServerAllocations(flt.ObjectMeta.Namespace).Create(ctx, gsa.DeepCopy(), metav1.CreateOptions{})
+				require.NoError(t, err)
+			}
+			framework.AssertFleetCondition(t, flt, func(entry *logrus.Entry, fleet *agonesv1.Fleet) bool {
+				log.WithField("fleet", fmt.Sprintf("%+v", fleet.Status)).Info("Checking for game server allocations")
+				return fleet.Status.AllocatedReplicas == testCase.wantAllocatedGs
+			})
+
+			counterFas := &autoscalingv1.FleetAutoscaler{
+				ObjectMeta: metav1.ObjectMeta{Name: flt.ObjectMeta.Name + "-counter-autoscaler", Namespace: framework.Namespace},
+				Spec: autoscalingv1.FleetAutoscalerSpec{
+					FleetName: flt.ObjectMeta.Name,
+					Policy: autoscalingv1.FleetAutoscalerPolicy{
+						Type:    autoscalingv1.CounterPolicyType,
+						Counter: &testCase.fas,
+					},
+					Sync: &autoscalingv1.FleetAutoscalerSync{
+						Type: autoscalingv1.FixedIntervalSyncType,
+						FixedInterval: autoscalingv1.FixedIntervalSync{
+							Seconds: 1,
+						},
+					},
+				},
+			}
+
+			fas, err := fleetautoscalers.Create(ctx, counterFas, metav1.CreateOptions{})
+			assert.NoError(t, err)
+			defer fleetautoscalers.Delete(ctx, fas.ObjectMeta.Name, metav1.DeleteOptions{}) // nolint:errcheck
+
+			framework.AssertFleetCondition(t, flt, func(entry *logrus.Entry, fleet *agonesv1.Fleet) bool {
+				return fleet.Status.AllocatedReplicas == testCase.wantAllocatedGs && fleet.Status.ReadyReplicas == testCase.wantReadyGs
+			})
+		})
+	}
+}
+
+func TestListAutoscaler(t *testing.T) {
+	if !runtime.FeatureEnabled(runtime.FeatureCountsAndLists) {
+		t.SkipNow()
+	}
+	t.Parallel()
+
+	ctx := context.Background()
+	client := framework.AgonesClient.AgonesV1()
+	log := e2e.TestLogger(t)
+
+	flt := defaultFleet(framework.Namespace)
+	flt.Spec.Template.Spec.Lists = map[string]agonesv1.ListStatus{
+		"games": {
+			Values:   []string{"game1", "game2", "game3"}, // AggregateCount 9
+			Capacity: 5,                                   // AggregateCapacity 15
+		},
+	}
+
+	flt, err := client.Fleets(framework.Namespace).Create(ctx, flt.DeepCopy(), metav1.CreateOptions{})
+	require.NoError(t, err)
+	defer client.Fleets(framework.Namespace).Delete(ctx, flt.ObjectMeta.Name, metav1.DeleteOptions{}) // nolint:errcheck
+	framework.AssertFleetCondition(t, flt, e2e.FleetReadyCount(flt.Spec.Replicas))
+
+	fleetautoscalers := framework.AgonesClient.AutoscalingV1().FleetAutoscalers(framework.Namespace)
+
+	listFas := func(f func(fap *autoscalingv1.FleetAutoscalerPolicy)) *autoscalingv1.FleetAutoscaler {
+		fas := autoscalingv1.FleetAutoscaler{
+			ObjectMeta: metav1.ObjectMeta{Name: flt.ObjectMeta.Name + "-list-autoscaler", Namespace: framework.Namespace},
+			Spec: autoscalingv1.FleetAutoscalerSpec{
+				FleetName: flt.ObjectMeta.Name,
+				Policy: autoscalingv1.FleetAutoscalerPolicy{
+					Type: autoscalingv1.ListPolicyType,
+				},
+				Sync: &autoscalingv1.FleetAutoscalerSync{
+					Type: autoscalingv1.FixedIntervalSyncType,
+					FixedInterval: autoscalingv1.FixedIntervalSync{
+						Seconds: 1,
+					},
+				},
+			},
+		}
+		f(&fas.Spec.Policy)
+		return &fas
+	}
+	testCases := map[string]struct {
+		fas          *autoscalingv1.FleetAutoscaler
+		wantFasErr   bool
+		wantReplicas int32
+	}{
+		"Scale Down to Minimum 1 Replica": {
+			fas: listFas(func(fap *autoscalingv1.FleetAutoscalerPolicy) {
+				fap.List = &autoscalingv1.ListPolicy{
+					Key:         "games",
+					BufferSize:  intstr.FromInt(2),
+					MinCapacity: 0,
+					MaxCapacity: 3,
+				}
+			}),
+			wantFasErr:   false,
+			wantReplicas: 1, // Count:3 Capacity:5
+		},
+		"Scale Down to Buffer": {
+			fas: listFas(func(fap *autoscalingv1.FleetAutoscalerPolicy) {
+				fap.List = &autoscalingv1.ListPolicy{
+					Key:         "games",
+					BufferSize:  intstr.FromInt(3),
+					MinCapacity: 0,
+					MaxCapacity: 5,
+				}
+			}),
+			wantFasErr:   false,
+			wantReplicas: 2, // Count:6 Capacity:10
+		},
+		"MinCapacity Must Be Greater Than Zero Percentage Buffer": {
+			fas: listFas(func(fap *autoscalingv1.FleetAutoscalerPolicy) {
+				fap.List = &autoscalingv1.ListPolicy{
+					Key:         "games",
+					BufferSize:  intstr.FromString("50%"),
+					MinCapacity: 0,
+					MaxCapacity: 100,
+				}
+			}),
+			wantFasErr:   true,
+			wantReplicas: 3,
+		},
+		"Scale Up to MinCapacity": {
+			fas: listFas(func(fap *autoscalingv1.FleetAutoscalerPolicy) {
+				fap.List = &autoscalingv1.ListPolicy{
+					Key:         "games",
+					BufferSize:  intstr.FromInt(3),
+					MinCapacity: 16,
+					MaxCapacity: 100,
+				}
+			}),
+			wantFasErr:   false,
+			wantReplicas: 4, // Count:12 Capacity:20
+		},
+		"Scale Down to MinCapacity": {
+			fas: listFas(func(fap *autoscalingv1.FleetAutoscalerPolicy) {
+				fap.List = &autoscalingv1.ListPolicy{
+					Key:         "games",
+					BufferSize:  intstr.FromInt(1),
+					MinCapacity: 10,
+					MaxCapacity: 100,
+				}
+			}),
+			wantFasErr:   false,
+			wantReplicas: 2, // Count:6 Capacity:10
+		},
+		"MinCapacity Less Than Buffer Invalid": {
+			fas: listFas(func(fap *autoscalingv1.FleetAutoscalerPolicy) {
+				fap.List = &autoscalingv1.ListPolicy{
+					Key:         "games",
+					BufferSize:  intstr.FromInt(15),
+					MinCapacity: 5,
+					MaxCapacity: 25,
+				}
+			}),
+			wantFasErr:   true,
+			wantReplicas: 3,
+		},
+		"Scale Up to Buffer": {
+			fas: listFas(func(fap *autoscalingv1.FleetAutoscalerPolicy) {
+				fap.List = &autoscalingv1.ListPolicy{
+					Key:         "games",
+					BufferSize:  intstr.FromInt(15),
+					MinCapacity: 15,
+					MaxCapacity: 100,
+				}
+			}),
+			wantFasErr:   false,
+			wantReplicas: 8, // Count:24 Capacity:40
+		},
+		"Scale Up to MaxCapacity": {
+			fas: listFas(func(fap *autoscalingv1.FleetAutoscalerPolicy) {
+				fap.List = &autoscalingv1.ListPolicy{
+					Key:         "games",
+					BufferSize:  intstr.FromInt(15),
+					MinCapacity: 15,
+					MaxCapacity: 25,
+				}
+			}),
+			wantFasErr:   false,
+			wantReplicas: 5, // Count:15 Capacity:25
+		},
+	}
+	for name, testCase := range testCases {
+		t.Run(name, func(t *testing.T) {
+
+			fas, err := fleetautoscalers.Create(ctx, testCase.fas, metav1.CreateOptions{})
+			if testCase.wantFasErr {
+				assert.Error(t, err)
+				return
+			}
+			assert.NoError(t, err)
+
+			framework.AssertFleetCondition(t, flt, e2e.FleetReadyCount(testCase.wantReplicas))
+			fleetautoscalers.Delete(ctx, fas.ObjectMeta.Name, metav1.DeleteOptions{}) // nolint:errcheck
+
+			// Return to starting 3 replicas
+			framework.ScaleFleet(t, log, flt, 3)
+			framework.AssertFleetCondition(t, flt, e2e.FleetReadyCount(3))
+		})
+	}
+}
+
+func TestListAutoscalerAllocated(t *testing.T) {
+	if !runtime.FeatureEnabled(runtime.FeatureCountsAndLists) {
+		t.SkipNow()
+	}
+	t.Parallel()
+
+	ctx := context.Background()
+	client := framework.AgonesClient.AgonesV1()
+	log := e2e.TestLogger(t)
+
+	defaultFlt := defaultFleet(framework.Namespace)
+	defaultFlt.Spec.Template.Spec.Lists = map[string]agonesv1.ListStatus{
+		"gamers": {
+			Values:   []string{},
+			Capacity: 6, // AggregateCapacity 18
+		},
+	}
+
+	fleetautoscalers := framework.AgonesClient.AutoscalingV1().FleetAutoscalers(framework.Namespace)
+
+	testCases := map[string]struct {
+		fas                  autoscalingv1.ListPolicy
+		wantAllocatedGs      int32 // Must be >= 0 && <= 3
+		wantReadyGs          int32
+		wantSecondAllocation int32 // Must be <= wantReadyGs
+		wantSecondReady      int32
+	}{
+		"Scale Down Buffer Percent": {
+			fas: autoscalingv1.ListPolicy{
+				Key:         "gamers",
+				BufferSize:  intstr.FromString("50%"),
+				MinCapacity: 6,
+				MaxCapacity: 60,
+			},
+			wantAllocatedGs: 0,
+			wantReadyGs:     1,
+		},
+		"Scale Up Buffer Percent": {
+			fas: autoscalingv1.ListPolicy{
+				Key:         "gamers",
+				BufferSize:  intstr.FromString("50%"),
+				MinCapacity: 6,
+				MaxCapacity: 60,
+			},
+			wantAllocatedGs:      3,
+			wantReadyGs:          1,
+			wantSecondAllocation: 1,
+			wantSecondReady:      2,
+		},
+		"Scales Down to Number of Game Servers Allocated": {
+			fas: autoscalingv1.ListPolicy{
+				Key:         "gamers",
+				BufferSize:  intstr.FromInt(2),
+				MinCapacity: 6,
+				MaxCapacity: 60,
+			},
+			wantAllocatedGs: 2,
+			wantReadyGs:     0,
+		},
+	}
+	// nolint:dupl  // Linter errors on lines are duplicate of TestCounterAutoscalerAllocated
+	for name, testCase := range testCases {
+		t.Run(name, func(t *testing.T) {
+			flt, err := client.Fleets(framework.Namespace).Create(ctx, defaultFlt.DeepCopy(), metav1.CreateOptions{})
+			require.NoError(t, err)
+			defer client.Fleets(framework.Namespace).Delete(ctx, flt.ObjectMeta.Name, metav1.DeleteOptions{}) // nolint:errcheck
+			framework.AssertFleetCondition(t, flt, e2e.FleetReadyCount(flt.Spec.Replicas))
+
+			// Adds 4 gamers to each allocated gameserver.
+			gsa := allocationv1.GameServerAllocation{
+				Spec: allocationv1.GameServerAllocationSpec{
+					Selectors: []allocationv1.GameServerSelector{
+						{LabelSelector: metav1.LabelSelector{
+							MatchLabels: map[string]string{agonesv1.FleetNameLabel: flt.ObjectMeta.Name}}},
+					},
+					Lists: map[string]allocationv1.ListAction{
+						"gamers": {
+							AddValues: []string{"gamer1", "gamer2", "gamer3", "gamer4"},
+						}}}}
+
+			// Allocate game servers, as Buffer Percent scales up (or down) based on allocated aggregate capacity
+			for i := int32(0); i < testCase.wantAllocatedGs; i++ {
+				_, err := framework.AgonesClient.AllocationV1().GameServerAllocations(flt.ObjectMeta.Namespace).Create(ctx, gsa.DeepCopy(), metav1.CreateOptions{})
+				require.NoError(t, err)
+			}
+			framework.AssertFleetCondition(t, flt, func(entry *logrus.Entry, fleet *agonesv1.Fleet) bool {
+				log.WithField("fleet", fmt.Sprintf("%+v", fleet.Status)).Info("Checking for game server allocations")
+				return fleet.Status.AllocatedReplicas == testCase.wantAllocatedGs
+			})
+
+			listFas := &autoscalingv1.FleetAutoscaler{
+				ObjectMeta: metav1.ObjectMeta{Name: flt.ObjectMeta.Name + "-list-autoscaler", Namespace: framework.Namespace},
+				Spec: autoscalingv1.FleetAutoscalerSpec{
+					FleetName: flt.ObjectMeta.Name,
+					Policy: autoscalingv1.FleetAutoscalerPolicy{
+						Type: autoscalingv1.ListPolicyType,
+						List: &testCase.fas,
+					},
+					Sync: &autoscalingv1.FleetAutoscalerSync{
+						Type: autoscalingv1.FixedIntervalSyncType,
+						FixedInterval: autoscalingv1.FixedIntervalSync{
+							Seconds: 1,
+						},
+					},
+				},
+			}
+
+			fas, err := fleetautoscalers.Create(ctx, listFas, metav1.CreateOptions{})
+			assert.NoError(t, err)
+			defer fleetautoscalers.Delete(ctx, fas.ObjectMeta.Name, metav1.DeleteOptions{}) // nolint:errcheck
+
+			framework.AssertFleetCondition(t, flt, func(entry *logrus.Entry, fleet *agonesv1.Fleet) bool {
+				return fleet.Status.AllocatedReplicas == testCase.wantAllocatedGs && fleet.Status.ReadyReplicas == testCase.wantReadyGs
+			})
+
+			// If we're not looking for a second gameserver allocation action, exit test early.
+			if testCase.wantSecondAllocation == 0 {
+				return
+			}
+
+			for i := int32(0); i < testCase.wantSecondAllocation; i++ {
+				_, err := framework.AgonesClient.AllocationV1().GameServerAllocations(flt.ObjectMeta.Namespace).Create(ctx, gsa.DeepCopy(), metav1.CreateOptions{})
+				require.NoError(t, err)
+			}
+
+			framework.AssertFleetCondition(t, flt, func(entry *logrus.Entry, fleet *agonesv1.Fleet) bool {
+				log.WithField("fleet", fmt.Sprintf("%+v", fleet.Status)).Info("Checking for second game server allocations")
+				return fleet.Status.AllocatedReplicas == (testCase.wantAllocatedGs+testCase.wantSecondAllocation) &&
+					fleet.Status.ReadyReplicas == testCase.wantSecondReady
+			})
+
+		})
+	}
+}
+
+func TestListAutoscalerWithSDKMethods(t *testing.T) {
+	if !runtime.FeatureEnabled(runtime.FeatureCountsAndLists) {
+		t.SkipNow()
+	}
+	t.Parallel()
+
+	ctx := context.Background()
+	client := framework.AgonesClient.AgonesV1()
+
+	defaultFlt := defaultFleet(framework.Namespace)
+	defaultFlt.Spec.Template.Spec.Lists = map[string]agonesv1.ListStatus{
+		"sessions": {
+			Values:   []string{"session1", "session2"}, // AggregateCount 6
+			Capacity: 4,                                // AggregateCapacity 12
+		},
+	}
+
+	fleetautoscalers := framework.AgonesClient.AutoscalingV1().FleetAutoscalers(framework.Namespace)
+
+	testCases := map[string]struct {
+		fas           autoscalingv1.ListPolicy
+		order         string // Priority order Ascending or Descending for fleet ready replica deletion
+		msg           string // See agones/examples/simple-game-server/README for list of commands
+		startReplicas int32  // After applying autoscaler policy but before sending update message
+		wantReplicas  int32  // After applying autoscaler policy and sending update message
+	}{
+		"Scale Up to Buffer": {
+			fas: autoscalingv1.ListPolicy{
+				Key:         "sessions",
+				BufferSize:  intstr.FromInt(10),
+				MinCapacity: 12,
+				MaxCapacity: 400,
+			},
+			order:         agonesv1.GameServerPriorityAscending,
+			msg:           "APPEND_LIST_VALUE sessions session0",
+			startReplicas: 5,
+			wantReplicas:  6,
+		},
+		"Scale Down to Buffer": {
+			fas: autoscalingv1.ListPolicy{
+				Key:         "sessions",
+				BufferSize:  intstr.FromInt(3),
+				MinCapacity: 3,
+				MaxCapacity: 400,
+			},
+			msg:           "DELETE_LIST_VALUE sessions session1",
+			order:         agonesv1.GameServerPriorityDescending,
+			startReplicas: 2,
+			wantReplicas:  1,
+		},
+	}
+	for name, testCase := range testCases {
+		t.Run(name, func(t *testing.T) {
+			defaultFlt.Spec.Priorities = []agonesv1.Priority{
+				{
+					Type:  agonesv1.GameServerPriorityList,
+					Key:   "sessions",
+					Order: testCase.order,
+				},
+			}
+			flt, err := client.Fleets(framework.Namespace).Create(ctx, defaultFlt.DeepCopy(), metav1.CreateOptions{})
+			require.NoError(t, err)
+			defer client.Fleets(framework.Namespace).Delete(ctx, flt.ObjectMeta.Name, metav1.DeleteOptions{}) // nolint:errcheck
+			framework.AssertFleetCondition(t, flt, e2e.FleetReadyCount(flt.Spec.Replicas))
+
+			listFas := &autoscalingv1.FleetAutoscaler{
+				ObjectMeta: metav1.ObjectMeta{Name: flt.ObjectMeta.Name + "-list-autoscaler", Namespace: framework.Namespace},
+				Spec: autoscalingv1.FleetAutoscalerSpec{
+					FleetName: flt.ObjectMeta.Name,
+					Policy: autoscalingv1.FleetAutoscalerPolicy{
+						Type: autoscalingv1.ListPolicyType,
+						List: &testCase.fas,
+					},
+					Sync: &autoscalingv1.FleetAutoscalerSync{
+						Type: autoscalingv1.FixedIntervalSyncType,
+						FixedInterval: autoscalingv1.FixedIntervalSync{
+							Seconds: 1,
+						},
+					},
+				},
+			}
+
+			fas, err := fleetautoscalers.Create(ctx, listFas, metav1.CreateOptions{})
+			assert.NoError(t, err)
+			defer fleetautoscalers.Delete(ctx, fas.ObjectMeta.Name, metav1.DeleteOptions{}) // nolint:errcheck
+
+			// Wait until autoscaler has first re-sized before getting the list of gameservers
+			framework.AssertFleetCondition(t, flt, e2e.FleetReadyCount(testCase.startReplicas))
+
+			gameservers, err := framework.ListGameServersFromFleet(flt)
+			assert.NoError(t, err)
+
+			logrus.WithField("msg", testCase.msg).Info(name)
+			_, err = framework.SendGameServerUDP(t, &gameservers[1], testCase.msg)
+			require.NoError(t, err)
+
+			framework.AssertFleetCondition(t, flt, e2e.FleetReadyCount(testCase.wantReplicas))
+		})
+	}
 }

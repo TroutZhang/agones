@@ -76,17 +76,8 @@ type Framework struct {
 	PerfOutputDir   string
 	Version         string
 	Namespace       string
-}
-
-// New setups a testing framework using a kubeconfig path and the game server image to use for testing.
-func New(kubeconfig string) (*Framework, error) {
-	return newFramework(kubeconfig, 0, 0)
-}
-
-// NewWithRates setups a testing framework using a kubeconfig path and the game server image
-// to use for load testing with QPS and Burst overwrites.
-func NewWithRates(kubeconfig string, qps float32, burst int) (*Framework, error) {
-	return newFramework(kubeconfig, qps, burst)
+	CloudProduct    string
+	WaitForState    time.Duration // default time to wait for state changes, may change based on cloud product.
 }
 
 func newFramework(kubeconfig string, qps float32, burst int) (*Framework, error) {
@@ -126,6 +117,7 @@ const (
 	perfOutputDirFlag   = "perf-output"
 	versionFlag         = "version"
 	namespaceFlag       = "namespace"
+	cloudProductFlag    = "cloud-product"
 )
 
 // ParseTestFlags Parses go test flags separately because pflag package ignores flags with '-test.' prefix
@@ -157,13 +149,14 @@ func NewFromFlags() (*Framework, error) {
 	}
 
 	viper.SetDefault(kubeconfigFlag, filepath.Join(usr.HomeDir, ".kube", "config"))
-	viper.SetDefault(gsimageFlag, "gcr.io/agones-images/simple-game-server:0.14")
+	viper.SetDefault(gsimageFlag, "us-docker.pkg.dev/agones-images/examples/simple-game-server:0.22")
 	viper.SetDefault(pullSecretFlag, "")
 	viper.SetDefault(stressTestLevelFlag, 0)
 	viper.SetDefault(perfOutputDirFlag, "")
 	viper.SetDefault(versionFlag, "")
 	viper.SetDefault(runtime.FeatureGateFlag, "")
 	viper.SetDefault(namespaceFlag, "")
+	viper.SetDefault(cloudProductFlag, "generic")
 
 	pflag.String(kubeconfigFlag, viper.GetString(kubeconfigFlag), "kube config path, e.g. $HOME/.kube/config")
 	pflag.String(gsimageFlag, viper.GetString(gsimageFlag), "gameserver image to use for those tests")
@@ -172,6 +165,7 @@ func NewFromFlags() (*Framework, error) {
 	pflag.String(perfOutputDirFlag, viper.GetString(perfOutputDirFlag), "write performance statistics to the specified directory")
 	pflag.String(versionFlag, viper.GetString(versionFlag), "agones controller version to be tested, consists of release version plus a short hash of the latest commit")
 	pflag.String(namespaceFlag, viper.GetString(namespaceFlag), "namespace is used to isolate test runs to their own namespaces")
+	pflag.String(cloudProductFlag, viper.GetString(cloudProductFlag), "cloud product of cluster references by kubeconfig; defaults to 'generic'; options are 'generic', 'gke-autopilot'")
 	runtime.FeaturesBindFlags()
 	pflag.Parse()
 
@@ -183,11 +177,12 @@ func NewFromFlags() (*Framework, error) {
 	runtime.Must(viper.BindEnv(perfOutputDirFlag))
 	runtime.Must(viper.BindEnv(versionFlag))
 	runtime.Must(viper.BindEnv(namespaceFlag))
+	runtime.Must(viper.BindEnv(cloudProductFlag))
 	runtime.Must(viper.BindPFlags(pflag.CommandLine))
 	runtime.Must(runtime.FeaturesBindEnv())
 	runtime.Must(runtime.ParseFeaturesFromEnv())
 
-	framework, err := New(viper.GetString(kubeconfigFlag))
+	framework, err := newFramework(viper.GetString(kubeconfigFlag), 0, 0)
 	if err != nil {
 		return framework, err
 	}
@@ -197,6 +192,11 @@ func NewFromFlags() (*Framework, error) {
 	framework.PerfOutputDir = viper.GetString(perfOutputDirFlag)
 	framework.Version = viper.GetString(versionFlag)
 	framework.Namespace = viper.GetString(namespaceFlag)
+	framework.CloudProduct = viper.GetString(cloudProductFlag)
+	framework.WaitForState = 5 * time.Minute
+	if framework.CloudProduct == "gke-autopilot" {
+		framework.WaitForState = 10 * time.Minute // Autopilot can take a little while due to autoscaling, be a little liberal.
+	}
 
 	logrus.WithField("gameServerImage", framework.GameServerImage).
 		WithField("pullSecret", framework.PullSecret).
@@ -204,6 +204,7 @@ func NewFromFlags() (*Framework, error) {
 		WithField("perfOutputDir", framework.PerfOutputDir).
 		WithField("version", framework.Version).
 		WithField("namespace", framework.Namespace).
+		WithField("cloudProduct", framework.CloudProduct).
 		WithField("featureGates", runtime.EncodeFeatures()).
 		Info("Starting e2e test(s)")
 
@@ -221,7 +222,7 @@ func (f *Framework) CreateGameServerAndWaitUntilReady(t *testing.T, ns string, g
 
 	log.WithField("gs", newGs.ObjectMeta.Name).Info("GameServer created, waiting for Ready")
 
-	readyGs, err := f.WaitForGameServerState(t, newGs, agonesv1.GameServerStateReady, 5*time.Minute)
+	readyGs, err := f.WaitForGameServerState(t, newGs, agonesv1.GameServerStateReady, f.WaitForState)
 
 	if err != nil {
 		return nil, fmt.Errorf("waiting for %v GameServer instance readiness timed out (%v): %v",
@@ -238,7 +239,7 @@ func (f *Framework) CreateGameServerAndWaitUntilReady(t *testing.T, ns string, g
 	}
 
 	if len(readyGs.Status.Ports) != expectedPortCount {
-		return nil, fmt.Errorf("Ready GameServer instance has %d port(s), want %d", len(readyGs.Status.Ports), expectedPortCount)
+		return nil, fmt.Errorf("ready GameServer instance has %d port(s), want %d", len(readyGs.Status.Ports), expectedPortCount)
 	}
 
 	logrus.WithField("gs", newGs.ObjectMeta.Name).Info("GameServer Ready")
@@ -254,35 +255,44 @@ func (f *Framework) WaitForGameServerState(t *testing.T, gs *agonesv1.GameServer
 
 	var checkGs *agonesv1.GameServer
 
-	err := wait.PollImmediate(1*time.Second, timeout, func() (bool, error) {
+	err := wait.PollUntilContextTimeout(context.Background(), 1*time.Second, timeout, true, func(ctx context.Context) (bool, error) {
 		var err error
 		checkGs, err = f.AgonesClient.AgonesV1().GameServers(gs.Namespace).Get(context.Background(), gs.Name, metav1.GetOptions{})
 
 		if err != nil {
-			logrus.WithError(err).Warn("error retrieving gameserver")
+			log.WithError(err).Warn("error retrieving GameServer")
 			return false, nil
 		}
 
-		log.WithField("gs", checkGs.ObjectMeta.Name).
-			WithField("currentState", checkGs.Status.State).
-			WithField("awaitingState", state).Info("Waiting for states to match")
-
-		if checkGs.Status.State == state {
+		checkState := checkGs.Status.State
+		if checkState == state {
+			log.WithField("gs", checkGs.ObjectMeta.Name).
+				WithField("currentState", checkState).
+				WithField("awaitingState", state).Info("GameServer states match")
 			return true, nil
 		}
+		if agonesv1.TerminalGameServerStates[checkState] {
+			log.WithField("gs", checkGs.ObjectMeta.Name).
+				WithField("currentState", checkState).
+				WithField("awaitingState", state).Error("GameServer reached terminal state")
+			return false, errors.Errorf("GameServer reached terminal state %s", checkState)
+		}
+		log.WithField("gs", checkGs.ObjectMeta.Name).
+			WithField("currentState", checkState).
+			WithField("awaitingState", state).Info("Waiting for states to match")
 
 		return false, nil
 	})
 
-	return checkGs, errors.Wrapf(err, "waiting for GameServer to be %v %v/%v",
-		state, gs.Namespace, gs.Name)
+	return checkGs, errors.Wrapf(err, "waiting for GameServer %v/%v to be %v",
+		gs.Namespace, gs.Name, state)
 }
 
 // CycleAllocations repeatedly Allocates a GameServer in the Fleet (if one is available), once every specified period.
 // Each Allocated GameServer gets deleted allocDuration after it was Allocated.
 // GameServers will continue to be Allocated until a message is passed to the done channel.
 func (f *Framework) CycleAllocations(ctx context.Context, t *testing.T, flt *agonesv1.Fleet, period time.Duration, allocDuration time.Duration) {
-	err := wait.PollImmediateUntil(period, func() (bool, error) {
+	err := wait.PollUntilContextCancel(ctx, period, true, func(ctx context.Context) (bool, error) {
 		gsa := GetAllocation(flt)
 		gsa, err := f.AgonesClient.AllocationV1().GameServerAllocations(flt.Namespace).Create(context.Background(), gsa, metav1.CreateOptions{})
 		if err != nil || gsa.Status.State != allocationv1.GameServerAllocationAllocated {
@@ -298,11 +308,35 @@ func (f *Framework) CycleAllocations(ctx context.Context, t *testing.T, flt *ago
 		}(gsa)
 
 		return false, nil
-	}, ctx.Done())
+	})
 	// Ignore wait timeout error, will always be returned when the context is cancelled at the end of the test.
-	if err != wait.ErrWaitTimeout {
+	if !wait.Interrupted(err) {
 		require.NoError(t, err)
 	}
+}
+
+// ScaleFleet will scale a Fleet with retries to a specified replica size.
+func (f *Framework) ScaleFleet(t *testing.T, log *logrus.Entry, flt *agonesv1.Fleet, replicas int32) {
+	fleets := f.AgonesClient.AgonesV1().Fleets(f.Namespace)
+	ctx := context.Background()
+
+	require.Eventuallyf(t, func() bool {
+		flt, err := fleets.Get(ctx, flt.ObjectMeta.Name, metav1.GetOptions{})
+		if err != nil {
+			log.WithError(err).Info("Could not get Fleet")
+			return false
+		}
+
+		fltCopy := flt.DeepCopy()
+		fltCopy.Spec.Replicas = replicas
+		_, err = fleets.Update(ctx, fltCopy, metav1.UpdateOptions{})
+		if err != nil {
+			log.WithError(err).Info("Could not scale Fleet")
+			return false
+		}
+
+		return true
+	}, 5*time.Minute, time.Second, "Could not scale Fleet %s", flt.ObjectMeta.Name)
 }
 
 // AssertFleetCondition waits for the Fleet to be in a specific condition or fails the test if the condition can't be met in 5 minutes.
@@ -315,7 +349,7 @@ func (f *Framework) AssertFleetCondition(t *testing.T, flt *agonesv1.Fleet, cond
 func (f *Framework) WaitForFleetCondition(t *testing.T, flt *agonesv1.Fleet, condition func(*logrus.Entry, *agonesv1.Fleet) bool) error {
 	log := TestLogger(t).WithField("fleet", flt.Name)
 	log.Info("waiting for fleet condition")
-	err := wait.PollImmediate(2*time.Second, 5*time.Minute, func() (bool, error) {
+	err := wait.PollUntilContextTimeout(context.Background(), 2*time.Second, f.WaitForState, true, func(ctx context.Context) (bool, error) {
 		fleet, err := f.AgonesClient.AgonesV1().Fleets(flt.ObjectMeta.Namespace).Get(context.Background(), flt.ObjectMeta.Name, metav1.GetOptions{})
 		if err != nil {
 			return true, err
@@ -351,7 +385,7 @@ func (f *Framework) WaitForFleetCondition(t *testing.T, flt *agonesv1.Fleet, con
 func (f *Framework) WaitForFleetAutoScalerCondition(t *testing.T, fas *autoscaling.FleetAutoscaler, condition func(log *logrus.Entry, fas *autoscaling.FleetAutoscaler) bool) {
 	log := TestLogger(t).WithField("fleetautoscaler", fas.Name)
 	log.Info("waiting for fleetautoscaler condition")
-	err := wait.PollImmediate(2*time.Second, 2*time.Minute, func() (bool, error) {
+	err := wait.PollUntilContextTimeout(context.Background(), 2*time.Second, 2*time.Minute, true, func(ctx context.Context) (bool, error) {
 		fleetautoscaler, err := f.AgonesClient.AutoscalingV1().FleetAutoscalers(fas.ObjectMeta.Namespace).Get(context.Background(), fas.ObjectMeta.Name, metav1.GetOptions{})
 		if err != nil {
 			return true, err
@@ -414,7 +448,7 @@ func (f *Framework) WaitForFleetGameServersCondition(flt *agonesv1.Fleet,
 // specified by a callback and the size of GameServers to match fleet's Spec.Replicas.
 func (f *Framework) WaitForFleetGameServerListCondition(flt *agonesv1.Fleet,
 	cond func(servers []agonesv1.GameServer) bool) error {
-	return wait.Poll(2*time.Second, 5*time.Minute, func() (done bool, err error) {
+	return wait.PollUntilContextTimeout(context.Background(), 2*time.Second, f.WaitForState, true, func(ctx context.Context) (done bool, err error) {
 		gsList, err := f.ListGameServersFromFleet(flt)
 		if err != nil {
 			return false, err
@@ -531,8 +565,7 @@ func (f *Framework) SendUDP(t *testing.T, address, msg string) (string, error) {
 	b := make([]byte, 1024)
 	var n int
 	// sometimes we get I/O timeout, so let's do a retry
-	err := wait.PollImmediate(2*time.Second, time.Minute, func() (bool, error) {
-
+	err := wait.PollUntilContextTimeout(context.Background(), 2*time.Second, time.Minute, true, func(ctx context.Context) (bool, error) {
 		conn, err := net.Dial("udp", address)
 		if err != nil {
 			log.WithError(err).Info("could not dial address")
@@ -584,7 +617,7 @@ func SendGameServerTCP(gs *agonesv1.GameServer, msg string) (string, error) {
 			return SendGameServerTCPToPort(gs, p.Name, msg)
 		}
 	}
-	return "", errors.New("No UDP ports")
+	return "", errors.New("No TCP ports")
 }
 
 // SendGameServerTCPToPort sends a message to a gameserver at the named port and returns its reply
@@ -799,6 +832,13 @@ func (f *Framework) LogEvents(t *testing.T, log *logrus.Entry, namespace string,
 	for i := range events.Items {
 		event := events.Items[i]
 		log.WithField("lastTimestamp", event.LastTimestamp).WithField("type", event.Type).WithField("reason", event.Reason).WithField("message", event.Message).Info("Event!")
+	}
+}
+
+// SkipOnCloudProduct skips the test if the e2e was invoked with --cloud-product=<product>.
+func (f *Framework) SkipOnCloudProduct(t *testing.T, product, reason string) {
+	if f.CloudProduct == product {
+		t.Skipf("skipping test on cloud product %s: %s", product, reason)
 	}
 }
 

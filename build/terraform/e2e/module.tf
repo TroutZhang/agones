@@ -14,6 +14,7 @@
 
 
 // Run:
+//  terraform init -backend-config="bucket=<YOUR_GCP_ProjectID>-e2e-infra-bucket-tfstate" -backend-config="prefix=terraform/state"
 //  terraform apply -var project="<YOUR_GCP_ProjectID>"
 
 terraform {
@@ -21,54 +22,58 @@ terraform {
   required_providers {
     google = {
       source = "hashicorp/google"
-      version = "~> 3.88"
+      version = "~> 4.25.0"
     }
     helm = {
       source = "hashicorp/helm"
       version = "~> 2.3"
     }
   }
-}
-
-variable "project" {
-  default = ""
-}
-
-module "gke_cluster" {
-  source = "../../../install/terraform/modules/gke"
-
-  cluster = {
-    "name"             = "e2e-test-cluster"
-    "zone"             = "us-west1-c"
-    "machineType"      = "e2-standard-4"
-    "initialNodeCount" = 10
-    "project"          = var.project
-  }
-
-  firewallName = "gke-game-server-firewall"
-}
-
-provider "helm" {
-  kubernetes {
-    host                   = module.gke_cluster.host
-    token                  = module.gke_cluster.token
-    cluster_ca_certificate = module.gke_cluster.cluster_ca_certificate
+  backend "gcs" {
   }
 }
 
-resource "helm_release" "consul" {
-  chart = "hashicorp/consul"
-  name  = "consul"
+variable "project" {}
+variable "kubernetes_versions" {
+  description = "Create e2e test clusters with these k8s versions in these regions"
+  type        = map(list(string))
+  default     = {
+    "1.26" = ["asia-east1", "REGULAR"]
+    "1.27" = ["us-east1", "REGULAR"]
+    "1.28" = ["us-west1", "RAPID"]
+  }
+}
 
-  set {
-    name  = "server.replicas"
-    value = "1"
+module "gke_standard_cluster" {
+  for_each = var.kubernetes_versions
+  source = "./gke-standard"
+  project = var.project
+  kubernetesVersion = each.key
+  location = each.value[0]
+  releaseChannel = each.value[1]
+}
+
+module "gke_autopilot_cluster" {
+  for_each = var.kubernetes_versions
+  source = "./gke-autopilot"
+  project = var.project
+  kubernetesVersion = each.key
+  location = each.value[0]
+  releaseChannel = each.value[1]
+}
+
+resource "google_compute_firewall" "udp" {
+  name    = "gke-game-server-firewall"
+  project = var.project
+  network = "default"
+
+  allow {
+    protocol = "udp"
+    ports    = ["7000-8000"]
   }
 
-  set {
-    name  = "ui.service.type"
-    value = "ClusterIP"
-  }
+  target_tags = ["game-server"]
+  source_ranges = ["0.0.0.0/0"]
 }
 
 resource "google_compute_firewall" "tcp" {
@@ -82,4 +87,5 @@ resource "google_compute_firewall" "tcp" {
   }
 
   target_tags = ["game-server"]
+  source_ranges = ["0.0.0.0/0"]
 }
